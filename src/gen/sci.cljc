@@ -4,6 +4,9 @@
             [gen.choicemap]
             [gen.clerk.callout]
             [gen.clerk.viewer]
+            [gen.combinator.map]
+            [gen.combinator.switch]
+            [gen.combinator.unfold]
             [gen.diff]
             [gen.distribution]
             [gen.distribution.kixi]
@@ -12,6 +15,8 @@
             [gen.generative-function]
             [gen.inference.importance]
             [gen.inference.mh]
+            [gen.inference.particle-filter]
+            [gen.inference.util]
             [gen.selection]
             [gen.trace]
             [sci.core :as sci]
@@ -39,8 +44,13 @@
                                              (assoc 'gen gen-macro
                                                     'untraced untraced-macro))
    'gen.generative-function              (sci/copy-ns gen.generative-function (sci/create-ns 'gen.generative-function))
+   'gen.combinator.map                   (sci/copy-ns gen.combinator.map (sci/create-ns 'gen.combinator.map))
+   'gen.combinator.switch                (sci/copy-ns gen.combinator.switch (sci/create-ns 'gen.combinator.switch))
+   'gen.combinator.unfold                (sci/copy-ns gen.combinator.unfold (sci/create-ns 'gen.combinator.unfold))
    'gen.inference.importance             (sci/copy-ns gen.inference.importance (sci/create-ns 'gen.inference.importance))
    'gen.inference.mh                     (sci/copy-ns gen.inference.mh (sci/create-ns 'gen.inference.mh))
+   'gen.inference.particle-filter        (sci/copy-ns gen.inference.particle-filter (sci/create-ns 'gen.inference.particle-filter))
+   'gen.inference.util                   (sci/copy-ns gen.inference.util (sci/create-ns 'gen.inference.util))
    'gen.selection                        (sci/copy-ns gen.selection (sci/create-ns 'gen.selection))
    'gen.trace                            (sci/copy-ns gen.trace (sci/create-ns 'gen.trace))})
 
