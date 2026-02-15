@@ -6,7 +6,13 @@
    computation can be replayed as a pure MLX function for autodiff.
 
    Implements IChoiceGradients via value-and-grad on the replayed score,
-   and provides an HMC bridge for gradient-based inference."
+   and provides an HMC bridge for gradient-based inference.
+
+   The score function uses vectorized MLX operations: choice values are
+   packed into a single MLXArray vector, and all logpdfs are computed in
+   one element-wise gaussian-logpdf call + arr/sum. This batches ~6N
+   FFI round-trips down to ~6, with value-and-grad differentiating
+   1 vector arg instead of N scalars."
   (:require [clojure.walk :as walk]
             [gen.choicemap :as choicemap]
             [gen.distribution :as d]
@@ -14,22 +20,9 @@
             [gen.generative-function :as gf]
             [gen.mlx.array :as arr]
             [gen.mlx.distribution :as mlx-dist]
+            [gen.mlx.hmc :as hmc]
             [gen.mlx.transforms :as xforms]
-            [gen.trace :as trace])
-  (:import [java.util.concurrent ThreadLocalRandom]))
-
-;; ---------------------------------------------------------------------------
-;; MLX logpdf dispatch
-;; ---------------------------------------------------------------------------
-
-(defn- mlx-logpdf
-  "Compute differentiable logpdf for a distribution's GenerativeFn.
-   Prototype: only supports normal distribution."
-  [dist-gf dist-args mlx-value]
-  (when-not (= dist-gf mlx-dist/normal)
-    (throw (ex-info "mlx-logpdf only supports mlx-dist/normal"
-                    {:dist-gf dist-gf})))
-  (mlx-dist/gaussian-logpdf (first dist-args) (second dist-args) mlx-value))
+            [gen.trace :as trace]))
 
 ;; ---------------------------------------------------------------------------
 ;; MLXTrace — forward declaration for use in defrecord
@@ -125,30 +118,43 @@
   (get-score [_] score))
 
 ;; ---------------------------------------------------------------------------
-;; build-score-fn — replay model to construct differentiable score
+;; build-score-fn — vectorized two-phase replay
+;;
+;; Phase 1 (JVM): replay model with JVM doubles extracted from input vector
+;;   to collect distribution parameters at each address.
+;; Phase 2 (MLX): one vectorized gaussian-logpdf + arr/sum.
+;;
+;; This batches ~6N FFI ops down to ~6 regardless of N choices.
 ;; ---------------------------------------------------------------------------
 
 (defn build-score-fn
-  "Build a pure function (MLXArray... -> MLXArray) that replays the model,
-   substituting MLXArray values for each choice and computing score via
-   differentiable logpdf. Distribution params that depend on other choices
-   are computed in JVM land (constants from MLX's perspective)."
-  [gf model-args addr-info sorted-addrs]
-  (fn [& mlx-vals]
-    (let [addr->mlx (zipmap sorted-addrs mlx-vals)
-          !score    (volatile! (arr/scalar 0.0))]
+  "Build a pure function (MLXArray -> MLXArray) that computes the total
+   log-probability of all choices. Takes a single MLXArray vector of
+   choice values (ordered by sorted-addrs) and returns a scalar MLXArray.
+
+   Phase 1 replays the model in JVM to collect dist params (which may
+   depend on earlier choices). Phase 2 computes all logpdfs in one
+   vectorized MLX call."
+  [gf model-args sorted-addrs]
+  (fn [values-arr]
+    ;; Phase 1: extract JVM doubles, replay model to collect dist params
+    (let [jvm-vals  (arr/->vec values-arr)
+          addr->jvm (zipmap sorted-addrs jvm-vals)
+          !params   (volatile! [])]
       (binding [dynamic/*trace*
                 (fn
                   ([inner-gf inner-args]
                    (apply (.-clojure-fn ^MLXDynamicDSLFunction inner-gf)
                           inner-args))
-                  ([k dist-gf dist-args]
-                   (let [mlx-v (get addr->mlx k)
-                         lp    (mlx-logpdf dist-gf dist-args mlx-v)]
-                     (vswap! !score #(arr/add % lp))
-                     (arr/->double mlx-v))))]
-        (apply (.-clojure-fn ^MLXDynamicDSLFunction gf) model-args)
-        @!score))))
+                  ([k _dist-gf dist-args]
+                   (vswap! !params conj (vec dist-args))
+                   (get addr->jvm k)))]
+        (apply (.-clojure-fn ^MLXDynamicDSLFunction gf) model-args))
+      ;; Phase 2: vectorized logpdf
+      (let [params @!params
+            mus    (arr/from-vec (mapv #(double (first %)) params))
+            sigmas (arr/from-vec (mapv #(double (second %)) params))]
+        (arr/sum (mlx-dist/gaussian-logpdf mus sigmas values-arr))))))
 
 ;; ---------------------------------------------------------------------------
 ;; IChoiceGradients
@@ -157,17 +163,16 @@
 (extend-type MLXTrace
   trace/IChoiceGradients
   (choice-gradients [trace _selection _retgrad]
-    (let [gf        (.-gen-fn trace)
+    (let [gf         (.-gen-fn trace)
           model-args (.-args trace)
-          info      (.-addr-info trace)
-          choices   (.-choices trace)
+          info       (.-addr-info trace)
+          choices    (.-choices trace)
           sorted-addrs (mapv :addr info)
-          n         (count sorted-addrs)
-          score-fn  (build-score-fn gf model-args info sorted-addrs)
-          vag-fn    (xforms/value-and-grad score-fn {:argnums (vec (range n))})
-          mlx-vals  (mapv #(arr/scalar (double (get choices %))) sorted-addrs)
-          result    (apply vag-fn mlx-vals)
-          grads     (:grads result)]
+          score-fn   (build-score-fn gf model-args sorted-addrs)
+          vag-fn     (xforms/value-and-grad score-fn)
+          values-arr (arr/from-vec (mapv #(double (get choices %)) sorted-addrs))
+          result     (vag-fn values-arr)
+          grad-vec   (arr/->vec (first (:grads result)))]
       {:arg-grads     nil
        :choice-values (choicemap/map->choicemap
                        (zipmap sorted-addrs
@@ -175,8 +180,7 @@
                                      sorted-addrs)))
        :choice-grads  (choicemap/map->choicemap
                        (zipmap sorted-addrs
-                               (mapv #(choicemap/->Choice (arr/->double %))
-                                     grads)))})))
+                               (mapv choicemap/->Choice grad-vec)))})))
 
 ;; ---------------------------------------------------------------------------
 ;; gen macro
@@ -209,84 +213,35 @@
   (apply gen-body args))
 
 ;; ---------------------------------------------------------------------------
-;; HMC bridge
+;; HMC bridge — delegates to standalone gen.mlx.hmc
 ;; ---------------------------------------------------------------------------
-
-(defn- sample-momentum [n]
-  (let [rng (ThreadLocalRandom/current)]
-    (mapv (fn [_] (.nextGaussian rng)) (range n))))
-
-(defn- kinetic-energy [p]
-  (* 0.5 (reduce + (map #(* % %) p))))
 
 (defn hmc-sample
   "Run HMC on the choices of an MLXTrace.
 
-   Internally uses JVM-double vectors for leapfrog arithmetic and
-   calls the MLX value-and-grad function for gradient evaluation.
+   Builds a vectorized score function from the trace and delegates to
+   gen.mlx.hmc/sample for leapfrog integration and MH accept/reject.
 
    Returns a vector of n-steps result maps, each containing:
-     :position    - vector of doubles
+     :position    - MLXArray vector
      :log-density - double
      :accepted?   - boolean
      :trace       - new MLXTrace with updated choices
      :choices     - {addr -> double}"
   [^MLXTrace trace n-steps & {:keys [L eps] :or {L 10 eps 0.01}}]
-  (let [gf         (.-gen-fn trace)
-        model-args (.-args trace)
-        info       (.-addr-info trace)
-        choices    (.-choices trace)
+  (let [gf           (.-gen-fn trace)
+        model-args   (.-args trace)
+        info         (.-addr-info trace)
+        choices      (.-choices trace)
         sorted-addrs (mapv :addr info)
-        n          (count sorted-addrs)
-        score-fn   (build-score-fn gf model-args info sorted-addrs)
-        vag-fn     (xforms/value-and-grad score-fn {:argnums (vec (range n))})
-        eval-vag   (fn [position]
-                     (let [mlx-args (mapv #(arr/scalar (double %)) position)
-                           result   (apply vag-fn mlx-args)]
-                       {:val  (arr/->double (:value result))
-                        :grad (mapv arr/->double (:grads result))}))
-        leapfrog   (fn [q p]
-                     (let [{:keys [grad]} (eval-vag q)
-                           p (mapv (fn [pi gi] (+ pi (* (/ eps 2.0) gi))) p grad)]
-                       (loop [i 0 q q p p]
-                         (if (>= i L)
-                           (let [{:keys [val grad]} (eval-vag q)
-                                 p-final (mapv (fn [pi gi] (+ pi (* (/ eps 2.0) gi)))
-                                               p grad)]
-                             {:position q :momentum p-final :log-density val})
-                           (let [q-new (mapv (fn [qi pi] (+ qi (* eps pi))) q p)]
-                             (if (< i (dec L))
-                               (let [{:keys [grad]} (eval-vag q-new)
-                                     p-new (mapv (fn [pi gi] (+ pi (* eps gi))) p grad)]
-                                 (recur (inc i) q-new p-new))
-                               (recur (inc i) q-new p)))))))
-        init-pos   (mapv #(double (get choices %)) sorted-addrs)
-        init-ld    (:val (eval-vag init-pos))]
-    (loop [i 0
-           pos init-pos
-           ld init-ld
-           results []]
-      (if (>= i n-steps)
-        results
-        (let [p         (sample-momentum n)
-              current-ke (kinetic-energy p)
-              current-H  (- current-ke ld)
-              proposal   (leapfrog pos p)
-              proposed-ld (:log-density proposal)
-              proposed-ke (kinetic-energy (:momentum proposal))
-              proposed-H  (- proposed-ke proposed-ld)
-              log-accept  (- current-H proposed-H)
-              accepted?   (< (Math/log (Math/random)) log-accept)
-              new-pos     (if accepted? (:position proposal) pos)
-              new-ld      (if accepted? proposed-ld ld)
-              new-choices (zipmap sorted-addrs new-pos)
-              new-trace   (->MLXTrace gf new-choices new-ld model-args
-                                      (.-retval trace) info)]
-          (recur (inc i)
-                 new-pos
-                 new-ld
-                 (conj results {:position    new-pos
-                                :log-density new-ld
-                                :accepted?   accepted?
-                                :trace       new-trace
-                                :choices     new-choices})))))))
+        score-fn     (build-score-fn gf model-args sorted-addrs)
+        init-pos     (arr/from-vec (mapv #(double (get choices %)) sorted-addrs))
+        raw-samples  (hmc/sample score-fn init-pos n-steps :L L :eps eps)]
+    (mapv (fn [sample]
+            (let [pos-vec     (arr/->vec (:position sample))
+                  new-choices (zipmap sorted-addrs pos-vec)]
+              (assoc sample
+                     :choices new-choices
+                     :trace   (->MLXTrace gf new-choices (:log-density sample)
+                                          model-args (.-retval trace) info))))
+          raw-samples)))

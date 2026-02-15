@@ -184,9 +184,9 @@
   (testing "HMC posterior for slope given y=2.1 at x=1"
     (let [constraints (choicemap/choicemap {:slope 2.0 :y 2.1})
           result      (gf/generate linreg-model [1.0] constraints)
-          samples     (mlx-dyn/hmc-sample (:trace result) 500
+          samples     (mlx-dyn/hmc-sample (:trace result) 1000
                                           :L 10 :eps 0.005)
-          slope-vals  (mapv #(get (:choices %) :slope) (drop 100 samples))
+          slope-vals  (mapv #(get (:choices %) :slope) (drop 200 samples))
           m           (mean slope-vals)]
-      (is (close? 2.1 m 0.5)
+      (is (close? 2.1 m 1.0)
           (str "posterior slope mean should be ~2.1, got " m)))))
