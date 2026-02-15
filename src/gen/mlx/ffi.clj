@@ -584,3 +584,22 @@
     (check-status! status "mlx_jvp")
     {:values (mem/deserialize-from res-vals ::vector-array)
      :jvps   (mem/deserialize-from res-jvps ::vector-array)}))
+
+;; ---------------------------------------------------------------------------
+;; Compile — trace once, reuse compiled graph
+;; ---------------------------------------------------------------------------
+
+(def ^:private raw-mlx-compile
+  "int mlx_compile(mlx_closure* res, const mlx_closure fun, bool shapeless)"
+  (ffi/cfn "mlx_compile"
+           [::mem/pointer ::closure ::mem/byte]
+           ::mem/int))
+
+(defn mlx-compile
+  "Compile a closure for optimized execution. Returns a new compiled closure."
+  [cls shapeless]
+  (let [arena (mem/auto-arena)
+        res (mem/alloc-instance ::closure arena)
+        status (raw-mlx-compile res cls (if shapeless (byte 1) (byte 0)))]
+    (check-status! status "mlx_compile")
+    (mem/deserialize-from res ::closure)))

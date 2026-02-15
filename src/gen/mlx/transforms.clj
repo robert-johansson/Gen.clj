@@ -1,5 +1,5 @@
 (ns gen.mlx.transforms
-  "Function transforms: grad, value-and-grad, vjp, jvp.
+  "Function transforms: grad, value-and-grad, vjp, jvp, compile.
    Wraps Clojure functions as mlx_closures and applies MLX's
    automatic differentiation transforms.
 
@@ -7,7 +7,9 @@
      (grad f)           — returns fn computing gradient only
      (value-and-grad f) — returns fn computing {:value :grads}
      (vjp f primals cotangents) — reverse-mode AD
-     (jvp f primals tangents)   — forward-mode AD"
+     (jvp f primals tangents)   — forward-mode AD
+     (compile f)        — trace once, reuse compiled graph (like JAX's jit)"
+  (:refer-clojure :exclude [compile])
   (:require [gen.mlx.ffi :as ffi]
             [gen.mlx.array :as arr]))
 
@@ -163,3 +165,37 @@
         (ffi/vector-array-free primals-va)
         (ffi/vector-array-free tangents-va)
         (ffi/closure-free cls)))))
+
+;; ---------------------------------------------------------------------------
+;; compile — trace once, reuse compiled graph (like JAX's jit)
+;; ---------------------------------------------------------------------------
+
+(defn compile
+  "Returns a compiled version of `f` that traces the computation graph
+   on first call and caches it. Subsequent calls with same-shaped inputs
+   skip graph construction and execute the optimized native kernel directly.
+
+   `f` takes one or more MLXArray args and returns a single MLXArray.
+
+   Options:
+     :shapeless — if true, handles varying input shapes without
+                  recompilation. Default false.
+
+   Example:
+     (let [f       (fn [x] (arr/mul x x))
+           fast-f  (compile f)]
+       @(fast-f (arr/scalar 3.0)))
+     ;; => 9.0  (first call traces + compiles, subsequent calls are fast)"
+  ([f] (compile f {}))
+  ([f {:keys [shapeless] :or {shapeless false}}]
+   (let [cls (->closure f)
+         compiled-cls (ffi/mlx-compile cls shapeless)]
+     (fn [& args]
+       (let [input-va (ffi/arrays->vector (map arr/handle args))]
+         (try
+           (let [output-va (ffi/closure-apply compiled-cls input-va)
+                 result (arr/wrap-handle (ffi/vector-array-get output-va 0))]
+             (ffi/vector-array-free output-va)
+             result)
+           (finally
+             (ffi/vector-array-free input-va))))))))
