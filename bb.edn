@@ -63,6 +63,10 @@
   {:doc "Release the library to Clojars."
    :task (shell "clojure -T:build publish")}
 
+  test:mlx
+  {:doc "Run MLX integration tests (requires macOS + Apple Silicon + JDK 22+)."
+   :task (shell "clojure -J--enable-native-access=ALL-UNNAMED -M:mlx:test:runner -d test-mlx")}
+
   lint-deps
   {:requires ([clj-kondo.core :as kondo])
    :doc "Lint dependencies."

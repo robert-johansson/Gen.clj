@@ -58,6 +58,11 @@
                "-s" "test"]
    :extra-deps {cloverage/cloverage {:mvn/version "1.2.4"}}}
 
+  :mlx
+  {:extra-deps {org.suskalo/coffi {:mvn/version "1.0.615"}}
+   :extra-paths ["test-mlx"]
+   :jvm-opts ["--enable-native-access=ALL-UNNAMED"]}
+
   :build
   {:deps
    {io.github.clojure/tools.build {:git/tag "v0.9.4" :git/sha "76b78fe"}
