@@ -1,6 +1,6 @@
 (ns gen.mlx.vmap-test
-  "Tests for manual batching patterns — parallel computation over batch dimensions.
-   Uses sum-axis + broadcasting + value-and-grad instead of vmap."
+  "Tests for vmap and manual batching patterns — parallel computation over
+   batch dimensions."
   (:require [clojure.test :refer [deftest is testing]]
             [gen.mlx.array :as arr]
             [gen.mlx.transforms :as xforms]))
@@ -112,3 +112,39 @@
       ;; chain 1: rejected → [3, 4]
       ;; chain 2: accepted → [50, 60]
       (is (= [10.0 20.0 3.0 4.0 50.0 60.0] (arr/->vec result))))))
+
+;; ---------------------------------------------------------------------------
+;; 7. vmap — element-wise square
+;; ---------------------------------------------------------------------------
+
+(deftest vmap-square
+  (testing "vmap applies element-wise function over batch dimension"
+    (let [f  (fn [x] (arr/mul x x))
+          vf (xforms/vmap f)
+          result (vf (arr/from-vec [1 2 3 4]))]
+      (is (= [4] (arr/shape result)))
+      (is (= [1.0 4.0 9.0 16.0] (arr/->vec result))))))
+
+;; ---------------------------------------------------------------------------
+;; 8. vmap — two inputs
+;; ---------------------------------------------------------------------------
+
+(deftest vmap-two-inputs
+  (testing "vmap with two batched inputs"
+    (let [f  (fn [x y] (arr/add x y))
+          vf (xforms/vmap f :in-axes [0 0])
+          result (vf (arr/from-vec [1 2 3]) (arr/from-vec [10 20 30]))]
+      (is (= [3] (arr/shape result)))
+      (is (= [11.0 22.0 33.0] (arr/->vec result))))))
+
+;; ---------------------------------------------------------------------------
+;; 9. vmap — multi-op function
+;; ---------------------------------------------------------------------------
+
+(deftest vmap-multi-op
+  (testing "vmap with a function that chains multiple ops"
+    (let [f  (fn [x] (arr/add (arr/mul x x) x))  ;; x^2 + x
+          vf (xforms/vmap f)
+          result (vf (arr/from-vec [0 1 2 3]))]
+      (is (= [4] (arr/shape result)))
+      (is (= [0.0 2.0 6.0 12.0] (arr/->vec result))))))

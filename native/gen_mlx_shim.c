@@ -292,10 +292,14 @@ int gen_mlx_vmap_apply(void** result_ctxs_out, int* n_outputs_out,
         mlx_vector_array_append_value(input_va, a);
     }
 
-    /* Phase 1: trace */
-    mlx_vector_array trace_outputs = {NULL};
+    /* Phase 1: trace
+     * mlx_detail_vmap_trace(res_0, res_1, ...):
+     *   res_0 = traced inputs (placeholders with vmap axis removed)
+     *   res_1 = traced outputs (result of fun(traced_inputs), has primitives)
+     */
     mlx_vector_array trace_inputs = {NULL};
-    int status = mlx_detail_vmap_trace(&trace_outputs, &trace_inputs,
+    mlx_vector_array trace_outputs = {NULL};
+    int status = mlx_detail_vmap_trace(&trace_inputs, &trace_outputs,
                                         cls, input_va,
                                         in_axes, (size_t)n_in_axes);
     if (status != 0) {

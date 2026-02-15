@@ -268,5 +268,76 @@
              (finally
                (ffi/vector-array-free input-va)))))))))
 
+;; ---------------------------------------------------------------------------
+;; vmap — vectorize a function over a batch dimension
+;; ---------------------------------------------------------------------------
 
+(defn vmap
+  "Vectorize `f` over a batch dimension, like JAX's vmap.
+
+   `f` takes one or more MLXArray args and returns a single MLXArray.
+   The returned function maps `f` over the specified axes of the inputs,
+   producing batched outputs.
+
+   Options:
+     :in-axes  — vector of axis indices to map over per input (default [0])
+     :out-axes — vector of axis indices for output batch dim (default [0])
+
+   Uses the C shim to fuse vmap_trace + vmap_replace in a single native call.
+
+   Example:
+     (let [f     (fn [x] (arr/mul x x))
+           vf    (vmap f)]
+       @(vf (arr/from-vec [1 2 3 4])))
+     ;; => [1.0 4.0 9.0 16.0]"
+  [f & {:keys [in-axes out-axes] :or {in-axes [0] out-axes [0]}}]
+  (let [cls (->closure f)]
+    (fn [& args]
+      (let [arena (java.lang.foreign.Arena/ofAuto)
+            n (count args)
+            ;; Write input ctx pointers
+            inputs-seg (.allocate arena (* 8 n) 8)
+            _ (dotimes [i n]
+                (.set ^java.lang.foreign.MemorySegment inputs-seg
+                      java.lang.foreign.ValueLayout/ADDRESS
+                      (long (* i 8))
+                      ^java.lang.foreign.MemorySegment
+                      (:ctx (arr/handle (nth args i)))))
+            ;; Prepare axes as native int arrays (MemorySegments, not Java int[])
+            in-axes-vec (vec (take n (concat in-axes (repeat (last in-axes)))))
+            in-axes-seg (.allocate arena (* 4 (count in-axes-vec)) 4)
+            _ (dotimes [i (count in-axes-vec)]
+                (.set ^java.lang.foreign.MemorySegment in-axes-seg
+                      java.lang.foreign.ValueLayout/JAVA_INT
+                      (long (* i 4))
+                      (int (nth in-axes-vec i))))
+            out-axes-seg (.allocate arena (* 4 (count out-axes)) 4)
+            _ (dotimes [i (count out-axes)]
+                (.set ^java.lang.foreign.MemorySegment out-axes-seg
+                      java.lang.foreign.ValueLayout/JAVA_INT
+                      (long (* i 4))
+                      (int (nth out-axes i))))
+            ;; Output buffer — up to 8 outputs
+            result-ptrs (.allocate arena (* 8 8) 8)
+            n-outputs-seg (.allocate arena 4 4)
+            status (int (.invokeWithArguments
+                         ^java.lang.invoke.MethodHandle ffi/fast-vmap-handle
+                         (object-array [result-ptrs n-outputs-seg
+                                        (:ctx cls)
+                                        inputs-seg (int n)
+                                        in-axes-seg (int (count in-axes-vec))
+                                        out-axes-seg (int (count out-axes))])))]
+        (when-not (zero? status)
+          (throw (ex-info "gen_mlx_vmap_apply failed" {:status status})))
+        (let [n-out (.get ^java.lang.foreign.MemorySegment n-outputs-seg
+                          java.lang.foreign.ValueLayout/JAVA_INT (long 0))]
+          (if (= 1 n-out)
+            (arr/wrap-handle
+             {:ctx (.get ^java.lang.foreign.MemorySegment result-ptrs
+                         java.lang.foreign.ValueLayout/ADDRESS (long 0))})
+            (mapv (fn [i]
+                    (arr/wrap-handle
+                     {:ctx (.get ^java.lang.foreign.MemorySegment result-ptrs
+                                 java.lang.foreign.ValueLayout/ADDRESS (long (* i 8)))}))
+                  (range n-out))))))))
 
