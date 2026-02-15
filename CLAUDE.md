@@ -256,6 +256,52 @@ The generative function becomes an *interaction protocol* — not a description 
 (particle-filter adaptive-experiment {:n-particles 100})
 ```
 
+## Benchmarks
+
+Run with `bb test:mlx` (benchmark tests in `gen.mlx.benchmark-inference-test`).
+
+### Hardware
+
+| Spec | Mac Mini M2 | Mac Mini M4 |
+|---|---|---|
+| CPU Cores | 8 (4P + 4E) | 10 (4P + 6E) |
+| GPU Cores | 10 | 10 |
+| RAM | 16 GB | 32 GB |
+
+### Inference Benchmarks
+
+**Benchmark 1: Normal Posterior (target μ=3.0, 500 steps)**
+
+| Method | M2 | M4 | Speedup |
+|---|---|---|---|
+| MH | 17.0 ms | 14.8 ms | 1.1x |
+| HMC (L=10, eps=0.1) | 1.54 s | 1.20 s | 1.3x |
+| NUTS | 1.10 s | 825 ms | 1.3x |
+
+**Benchmark 2: Linear Regression Scaling (HMC/NUTS wall-clock)**
+
+| N obs | M2 HMC | M4 HMC | M2 NUTS | M4 NUTS |
+|---|---|---|---|---|
+| 10 | 857 ms | 753 ms | 768 ms | 631 ms |
+| 50 | 1.23 s | 1.03 s | 731 ms | 708 ms |
+| 100 | 1.47 s | 1.28 s | 1.82 s | 925 ms |
+
+**Benchmark 3: MAP Convergence (target mode=[3,−2])**
+
+| Method | M2 | M4 |
+|---|---|---|
+| MAP (Adam) | 48.6 ms | 35.2 ms |
+
+**Benchmark 4: Parallel Chains (4 chains x 200 steps, Normal posterior)**
+
+| Method | M2 | M4 |
+|---|---|---|
+| 4x Sequential | 1.01 s | 722 ms |
+| 4x Parallel (vmap) | 469 ms | 498 ms |
+| Speedup | 2.1x | 1.4x |
+
+Parallel chains use `vmap` to map a single-sample score function over the batch dimension. The M4's faster single-chain performance leaves less room for parallelism gains.
+
 ## Companion Documents
 
 - **VISION.md** — Detailed phased roadmap, architectural principles, comparison with Gen.jl/GenJAX
