@@ -126,6 +126,16 @@
     (hmc-step* log-density-fn vag-fn position current-log-density n eps L)))
 
 ;; ---------------------------------------------------------------------------
+;; Single leapfrog step — used by NUTS for tree building
+;; ---------------------------------------------------------------------------
+
+(defn leapfrog-one-step
+  "Single leapfrog integration step. Returns {:position :momentum :log-density}.
+   Used by NUTS for tree building where each step extends the trajectory."
+  [vag-fn position momentum eps]
+  (leapfrog vag-fn position momentum eps 1))
+
+;; ---------------------------------------------------------------------------
 ;; Sampling — collect multiple HMC steps
 ;; ---------------------------------------------------------------------------
 
@@ -155,3 +165,25 @@
                  (:position step)
                  (:log-density step)
                  (conj results step)))))))
+
+;; ---------------------------------------------------------------------------
+;; MALA — Metropolis-Adjusted Langevin Algorithm (HMC with L=1)
+;; ---------------------------------------------------------------------------
+
+(defn mala-step
+  "Single MALA step (Metropolis-Adjusted Langevin Algorithm).
+   Equivalent to HMC with a single leapfrog step (L=1).
+
+   Returns {:position MLXArray, :log-density double, :accepted? boolean}."
+  [log-density-fn position & {:keys [eps] :or {eps 0.01}}]
+  (hmc-step log-density-fn position :L 1 :eps eps))
+
+(defn mala-sample
+  "Run MALA for n-steps iterations.
+
+   MALA is HMC with L=1 — a single gradient-informed proposal per step.
+   Simpler than full HMC but can be effective for well-conditioned targets.
+
+   Returns a vector of n-steps maps, each {:position :log-density :accepted?}."
+  [log-density-fn initial-position n-steps & {:keys [eps] :or {eps 0.01}}]
+  (sample log-density-fn initial-position n-steps :L 1 :eps eps))

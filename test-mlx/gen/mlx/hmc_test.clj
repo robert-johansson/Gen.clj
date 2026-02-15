@@ -147,3 +147,67 @@
       (is (instance? gen.mlx.array.MLXArray (:position result)))
       (is (number? (:log-density result)))
       (is (boolean? (:accepted? result))))))
+
+;; ---------------------------------------------------------------------------
+;; 7. MALA — single step (HMC with L=1)
+;; ---------------------------------------------------------------------------
+
+(deftest mala-step-returns-correct-structure
+  (testing "mala-step returns map with required keys"
+    (let [log-density (fn [x] (arr/mul -0.5 (arr/sum (arr/square x))))
+          result (hmc/mala-step log-density (arr/from-vec [0.0])
+                                :eps 0.1)]
+      (is (contains? result :position))
+      (is (contains? result :log-density))
+      (is (contains? result :accepted?))
+      (is (instance? gen.mlx.array.MLXArray (:position result))))))
+
+;; ---------------------------------------------------------------------------
+;; 8. MALA sampling — 1D standard normal
+;; ---------------------------------------------------------------------------
+
+(deftest mala-sample-1d-standard-normal
+  (testing "MALA samples from 1D standard normal"
+    (let [log-density (fn [x] (arr/mul -0.5 (arr/square (arr/sum x))))
+          results (hmc/mala-sample log-density (arr/from-vec [0.0]) 800
+                                   :eps 0.5)
+          samples (mapv #(first (arr/->vec (:position %)))
+                        (drop 200 results))
+          m (mean samples)
+          s (std samples)]
+      (is (close? 0.0 m 0.4)
+          (str "mean should be ≈ 0, got " m))
+      (is (close? 1.0 s 0.5)
+          (str "std should be ≈ 1, got " s)))))
+
+;; ---------------------------------------------------------------------------
+;; 9. MALA acceptance rate
+;; ---------------------------------------------------------------------------
+
+(deftest mala-acceptance-rate
+  (testing "MALA acceptance rate is reasonable"
+    (let [log-density (fn [x] (arr/mul -0.5 (arr/sum (arr/square x))))
+          results (hmc/mala-sample log-density (arr/from-vec [0.0]) 300
+                                   :eps 0.5)
+          n-accepted (count (filter :accepted? results))
+          rate (/ (double n-accepted) (count results))]
+      (is (> rate 0.1)
+          (str "acceptance rate should be > 10%, got " (* 100 rate) "%")))))
+
+;; ---------------------------------------------------------------------------
+;; 10. Leapfrog one step
+;; ---------------------------------------------------------------------------
+
+(deftest leapfrog-one-step-test
+  (testing "leapfrog-one-step returns valid result"
+    (let [log-density (fn [x] (arr/mul -0.5 (arr/sum (arr/square x))))
+          vag-fn (xforms/value-and-grad log-density)
+          q (arr/from-vec [1.0])
+          p (arr/from-vec [0.5])
+          result (hmc/leapfrog-one-step vag-fn q p 0.1)]
+      (is (contains? result :position))
+      (is (contains? result :momentum))
+      (is (contains? result :log-density))
+      (is (instance? gen.mlx.array.MLXArray (:position result)))
+      (is (instance? gen.mlx.array.MLXArray (:momentum result)))
+      (is (number? (:log-density result))))))
