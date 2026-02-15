@@ -603,3 +603,48 @@
         status (raw-mlx-compile res cls (if shapeless (byte 1) (byte 0)))]
     (check-status! status "mlx_compile")
     (mem/deserialize-from res ::closure)))
+
+;; ---------------------------------------------------------------------------
+;; Fast-path shim — single FFI call for compiled closure application
+;;
+;; The C shim (native/gen_mlx_shim.c) fuses vector-array construction,
+;; closure application, result extraction, and cleanup into one native call.
+;; Combined with direct Panama MethodHandle (bypassing coffi serialization),
+;; this reduces per-call overhead from ~8 FFI calls + 8 arenas to 1 FFI call.
+;; ---------------------------------------------------------------------------
+
+(defn- find-shim-lib []
+  (let [candidates ["native/libgen_mlx_shim.dylib"]]
+    (some (fn [path]
+            (let [f (io/file path)]
+              (when (.exists f)
+                (.getAbsolutePath f))))
+          candidates)))
+
+(defonce ^:private shim-lookup
+  (when-let [path (find-shim-lib)]
+    (java.lang.foreign.SymbolLookup/libraryLookup
+     (java.nio.file.Path/of path (into-array String []))
+     (java.lang.foreign.Arena/ofAuto))))
+
+(def ^:private fast-apply-descriptor
+  "FunctionDescriptor for: int gen_mlx_fast_apply(void*, void*, void*, int)"
+  (java.lang.foreign.FunctionDescriptor/of
+   java.lang.foreign.ValueLayout/JAVA_INT
+   (into-array java.lang.foreign.MemoryLayout
+               [java.lang.foreign.ValueLayout/ADDRESS
+                java.lang.foreign.ValueLayout/ADDRESS
+                java.lang.foreign.ValueLayout/ADDRESS
+                java.lang.foreign.ValueLayout/JAVA_INT])))
+
+(def fast-apply-handle
+  "Direct Panama MethodHandle for the fast-apply shim.
+   nil if shim library is not available (falls back to coffi path)."
+  (when shim-lookup
+    (let [opt (.find ^java.lang.foreign.SymbolLookup shim-lookup
+                     "gen_mlx_fast_apply")]
+      (when (.isPresent opt)
+        (.downcallHandle (java.lang.foreign.Linker/nativeLinker)
+                         ^java.lang.foreign.MemorySegment (.get opt)
+                         ^java.lang.foreign.FunctionDescriptor fast-apply-descriptor
+                         (into-array java.lang.foreign.Linker$Option []))))))

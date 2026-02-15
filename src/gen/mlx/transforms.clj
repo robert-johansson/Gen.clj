@@ -177,6 +177,10 @@
 
    `f` takes one or more MLXArray args and returns a single MLXArray.
 
+   When the native fast-path shim is available (native/libgen_mlx_shim.dylib),
+   uses a single FFI call via direct Panama MethodHandle, bypassing coffi
+   serialization entirely. Falls back to the coffi-based path otherwise.
+
    Options:
      :shapeless — if true, handles varying input shapes without
                   recompilation. Default false.
@@ -190,12 +194,41 @@
   ([f {:keys [shapeless] :or {shapeless false}}]
    (let [cls (->closure f)
          compiled-cls (ffi/mlx-compile cls shapeless)]
-     (fn [& args]
-       (let [input-va (ffi/arrays->vector (map arr/handle args))]
-         (try
-           (let [output-va (ffi/closure-apply compiled-cls input-va)
-                 result (arr/wrap-handle (ffi/vector-array-get output-va 0))]
-             (ffi/vector-array-free output-va)
-             result)
-           (finally
-             (ffi/vector-array-free input-va))))))))
+     (if ffi/fast-apply-handle
+       ;; Fast path: single FFI call via C shim + direct Panama MethodHandle.
+       ;; Pre-allocates reusable segments to eliminate per-call allocation.
+       (let [compiled-ctx (:ctx compiled-cls)
+             arena (java.lang.foreign.Arena/ofAuto)
+             out-seg (.allocate arena 8 8)
+             inputs-seg (.allocate arena (* 8 8) 8)] ;; up to 8 args
+         (fn [& args]
+           (let [n (count args)]
+             ;; Write input ctx pointers into contiguous buffer
+             (dotimes [i n]
+               (.set ^java.lang.foreign.MemorySegment inputs-seg
+                     java.lang.foreign.ValueLayout/ADDRESS
+                     (long (* i 8))
+                     ^java.lang.foreign.MemorySegment
+                     (:ctx (arr/handle (nth args i)))))
+             ;; Single FFI call: build vector + apply + extract + cleanup
+             (let [status (int (.invokeWithArguments
+                                ^java.lang.invoke.MethodHandle ffi/fast-apply-handle
+                                (object-array [out-seg compiled-ctx
+                                               inputs-seg (int n)])))]
+               (when-not (zero? status)
+                 (throw (ex-info "gen_mlx_fast_apply failed" {:status status})))
+               ;; Read result ctx pointer, wrap as GC-managed MLXArray
+               (arr/wrap-handle
+                {:ctx (.get ^java.lang.foreign.MemorySegment out-seg
+                            java.lang.foreign.ValueLayout/ADDRESS
+                            (long 0))})))))
+       ;; Fallback: coffi-based path (no shim available)
+       (fn [& args]
+         (let [input-va (ffi/arrays->vector (map arr/handle args))]
+           (try
+             (let [output-va (ffi/closure-apply compiled-cls input-va)
+                   result (arr/wrap-handle (ffi/vector-array-get output-va 0))]
+               (ffi/vector-array-free output-va)
+               result)
+             (finally
+               (ffi/vector-array-free input-va)))))))))
