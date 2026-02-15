@@ -14,9 +14,11 @@
             [gen.distribution :as d]
             [gen.dynamic :as dynamic]
             [gen.generative-function :as gf]
+            [gen.mlx.array :as arr]
             [gen.mlx.distribution :as mlx-dist]
             [gen.mlx.dynamic :as mlx-dyn]
-            [gen.trace :as trace]))
+            [gen.trace :as trace])
+  (:import [gen.mlx.dynamic MLXTrace]))
 
 (defn- close?
   ([expected actual] (close? expected actual 1e-3))
@@ -227,3 +229,76 @@
       (is (some? (:choice-grads grads)))
       (is (choicemap/has-submap? (:choice-grads grads) :x))
       (is (choicemap/has-submap? (:choice-grads grads) :rate)))))
+
+;; ---------------------------------------------------------------------------
+;; 10. Compiled score fn — same results as replay-based score fn
+;; ---------------------------------------------------------------------------
+
+(deftest compiled-score-fn-matches-replay
+  (testing "build-compiled-score-fn gives same score as build-score-fn"
+    (let [constraints (choicemap/choicemap {:a 0.5 :b 4.0})
+          result      (gf/generate independent-model [] constraints)
+          tr          (:trace result)
+          info        (.-addr-info ^MLXTrace tr)
+          choices     (.-choices ^MLXTrace tr)
+          sorted-addrs (mapv :addr info)
+          ;; Build both score functions
+          replay-fn   (mlx-dyn/build-score-fn independent-model [] sorted-addrs)
+          compiled-fn (mlx-dyn/build-compiled-score-fn independent-model [] sorted-addrs choices)
+          values-arr  (arr/from-vec (mapv #(double (get choices %)) sorted-addrs))
+          replay-score  (arr/->double (replay-fn values-arr))
+          compiled-score (arr/->double (compiled-fn values-arr))]
+      (is (close? replay-score compiled-score)
+          (str "compiled score " compiled-score " should match replay score " replay-score)))))
+
+;; ---------------------------------------------------------------------------
+;; 11. Selection-aware HMC — only samples selected addresses
+;; ---------------------------------------------------------------------------
+
+(def linreg-model-multi
+  (mlx-dyn/gen [xs]
+    (let [slope     (dynamic/trace! :slope mlx-dist/normal 0.0 10.0)
+          intercept (dynamic/trace! :intercept mlx-dist/normal 0.0 10.0)]
+      (doseq [i (range (count xs))]
+        (dynamic/trace! (keyword (str "y" i)) mlx-dist/normal
+                       (+ (* slope (nth xs i)) intercept) 0.5))
+      [slope intercept])))
+
+(deftest selection-aware-hmc
+  (testing "HMC with selection only updates selected addresses"
+    (let [xs         [0.0 0.5 1.0]
+          ys         [1.0 2.0 3.0]
+          y-constraints (reduce (fn [m i] (assoc m (keyword (str "y" i)) (nth ys i)))
+                                {} (range 3))
+          constraints (choicemap/choicemap (merge {:slope 2.0 :intercept 1.0} y-constraints))
+          result      (gf/generate linreg-model-multi [xs] constraints)
+          tr          (:trace result)
+          ;; Run HMC with selection — only slope and intercept
+          samples     (mlx-dyn/hmc-sample tr 50 :L 5 :eps 0.01
+                                          :selection #{:slope :intercept})]
+      ;; Observations should remain fixed
+      (doseq [sample samples]
+        (doseq [i (range 3)]
+          (let [y-addr (keyword (str "y" i))]
+            (is (close? (nth ys i) (get (:choices sample) y-addr))
+                (str y-addr " should remain fixed"))))))))
+
+(deftest selection-aware-map-optimize
+  (testing "MAP with selection only optimizes selected addresses"
+    (let [tr      (gf/simulate independent-model [])
+          result  (mlx-dyn/map-optimize tr 100 :lr 0.05 :selection #{:a})]
+      ;; :a should move towards its prior mean (0.0)
+      (is (close? 0.0 (get (:choices result) :a) 1.0)
+          "optimized :a should be near prior mean"))))
+
+(deftest selection-aware-nuts
+  (testing "NUTS with selection only samples selected addresses"
+    (let [constraints (choicemap/choicemap {:x 3.0})
+          result      (gf/generate normal-model [] constraints)
+          samples     (mlx-dyn/nuts-sample (:trace result) 100
+                                           :max-depth 3 :target-accept 0.8
+                                           :selection #{:x})
+          values      (mapv #(get (:choices %) :x) (drop 20 samples))
+          m           (mean values)]
+      (is (close? 3.0 m 1.0)
+          (str "NUTS with selection: mean should be ~3.0, got " m)))))

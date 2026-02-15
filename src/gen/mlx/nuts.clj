@@ -24,8 +24,7 @@
 (defn- sample-momentum
   "Sample momentum from N(0,I) of dimension n."
   [n]
-  (let [rng (ThreadLocalRandom/current)]
-    (arr/from-vec (mapv (fn [_] (.nextGaussian rng)) (range n)))))
+  (arr/random-normal [n]))
 
 (defn- kinetic-energy
   "Kinetic energy: 0.5 * sum(p^2). Returns a double."
@@ -275,8 +274,7 @@
    Starts at 1.0 and doubles or halves until acceptance probability ≈ 0.5."
   [vag-fn position]
   (let [n (arr/size position)
-        rng (ThreadLocalRandom/current)
-        p (arr/from-vec (mapv (fn [_] (.nextGaussian rng)) (range n)))
+        p (sample-momentum n)
         {:keys [value]} (vag-fn position)
         log-density (arr/->double value)
         joint0 (joint-log-prob log-density p)]

@@ -450,3 +450,75 @@
   [a]
   (let [a (ensure-array a)]
     (wrap-handle (ffi/mlx-sum (handle a)))))
+
+;; ---------------------------------------------------------------------------
+;; Matrix / linalg ops
+;; ---------------------------------------------------------------------------
+
+(defn matmul
+  "Matrix multiply two arrays."
+  [a b]
+  (let [a (ensure-array a) b (ensure-array b)]
+    (wrap-handle (ffi/mlx-matmul (handle a) (handle b)))))
+
+(defn transpose
+  "Reverse axes of an array."
+  [a]
+  (let [a (ensure-array a)]
+    (wrap-handle (ffi/mlx-transpose (handle a)))))
+
+(defn reshape
+  "Reshape array to new shape vector."
+  [a shape-vec]
+  (let [a (ensure-array a)]
+    (wrap-handle (ffi/mlx-reshape (handle a) shape-vec))))
+
+(defn power
+  "Element-wise power."
+  [a b]
+  (let [a (ensure-array a) b (ensure-array b)]
+    (wrap-handle (ffi/mlx-power (handle a) (handle b)))))
+
+(defn diagonal
+  "Extract diagonal from a 2-d array."
+  [a]
+  (let [a (ensure-array a)]
+    (wrap-handle (ffi/mlx-diagonal (handle a)))))
+
+(defn floor
+  "Element-wise floor."
+  [a]
+  (let [a (ensure-array a)]
+    (wrap-handle (ffi/mlx-floor (handle a)))))
+
+(defn from-2d
+  "Create a 2-d array from a vector of row vectors (each row same length)."
+  [rows]
+  (let [n-rows (count rows)
+        n-cols (count (first rows))
+        flat   (float-array (mapcat identity rows))]
+    (wrap-handle (ffi/array-new-data flat [n-rows n-cols]))))
+
+(defn cholesky
+  "Compute Cholesky decomposition. Returns lower-triangular L."
+  [a]
+  (let [a (ensure-array a)]
+    (wrap-handle (ffi/mlx-linalg-cholesky (handle a)))))
+
+(defn solve-triangular
+  "Solve triangular system A x = b. Default: lower-triangular."
+  [a b]
+  (let [a (ensure-array a) b (ensure-array b)]
+    (wrap-handle (ffi/mlx-linalg-solve-triangular (handle a) (handle b)))))
+
+;; ---------------------------------------------------------------------------
+;; Random number generation
+;; ---------------------------------------------------------------------------
+
+(defn random-normal
+  "Sample from N(0,I) with given shape. Returns MLXArray.
+   Uses MLX's native random number generator (avoids JVM->MLX round-trip)."
+  [shape]
+  (let [seed (System/nanoTime)
+        key-arr (ffi/random-key seed)]
+    (wrap-handle (ffi/random-normal shape key-arr))))

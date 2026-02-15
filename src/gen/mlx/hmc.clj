@@ -13,19 +13,17 @@
      (sample log-density (arr/from-vec [0.0]) 500)
      ;; => vector of {:position :log-density :accepted?}"
   (:require [gen.mlx.array :as arr]
-            [gen.mlx.transforms :as xforms])
-  (:import [java.util.concurrent ThreadLocalRandom]))
+            [gen.mlx.transforms :as xforms]))
 
 ;; ---------------------------------------------------------------------------
-;; Momentum sampling — JVM random, no need for MLX AD
+;; Momentum sampling — MLX native random
 ;; ---------------------------------------------------------------------------
 
 (defn- sample-momentum
   "Sample momentum from N(0,I) of dimension n.
-   Uses JVM ThreadLocalRandom (fast, no MLX overhead)."
+   Uses MLX native random (avoids JVM->MLX arr/from-vec round-trip)."
   [n]
-  (let [rng (ThreadLocalRandom/current)]
-    (arr/from-vec (mapv (fn [_] (.nextGaussian rng)) (range n)))))
+  (arr/random-normal [n]))
 
 ;; ---------------------------------------------------------------------------
 ;; Kinetic energy — 0.5 * p^T p

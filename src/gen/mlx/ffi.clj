@@ -303,6 +303,97 @@
     (mem/deserialize-from res ::array)))
 
 ;; ---------------------------------------------------------------------------
+;; Additional arithmetic/matrix ops
+;; ---------------------------------------------------------------------------
+
+(def mlx-matmul  (defop-binary "mlx_matmul"))
+(def mlx-power   (defop-binary "mlx_power"))
+(def mlx-floor   (defop-unary "mlx_floor"))
+
+;; transpose: int mlx_transpose(mlx_array* res, mlx_array a, mlx_stream s)
+(def mlx-transpose (defop-unary "mlx_transpose"))
+
+;; reshape: int mlx_reshape(mlx_array* res, mlx_array a, const int* shape,
+;;                          size_t shape_num, mlx_stream s)
+(def ^:private raw-mlx-reshape
+  (ffi/cfn "mlx_reshape"
+           [::mem/pointer ::array ::mem/pointer ::mem/long ::stream]
+           ::mem/int))
+
+(defn mlx-reshape
+  "Reshape an array to a new shape."
+  [a shape-vec]
+  (let [arena (mem/auto-arena)
+        n (count shape-vec)
+        shape-seg (mem/alloc (* 4 n) arena)
+        _ (dotimes [i n]
+            (.set (.reinterpret shape-seg (* 4 n))
+                  java.lang.foreign.ValueLayout/JAVA_INT
+                  (* i 4)
+                  (int (nth shape-vec i))))
+        res (mem/alloc-instance ::array arena)
+        status (raw-mlx-reshape res a shape-seg (long n) default-stream)]
+    (check-status! status "mlx_reshape")
+    (mem/deserialize-from res ::array)))
+
+;; diagonal: int mlx_diagonal(mlx_array* res, mlx_array a, int offset,
+;;                            int axis1, int axis2, mlx_stream s)
+(def ^:private raw-mlx-diagonal
+  (ffi/cfn "mlx_diagonal"
+           [::mem/pointer ::array ::mem/int ::mem/int ::mem/int ::stream]
+           ::mem/int))
+
+(defn mlx-diagonal
+  "Extract diagonal from a 2-d array."
+  ([a] (mlx-diagonal a 0 0 1))
+  ([a offset axis1 axis2]
+   (let [arena (mem/auto-arena)
+         res (mem/alloc-instance ::array arena)
+         status (raw-mlx-diagonal res a (int offset) (int axis1) (int axis2) default-stream)]
+     (check-status! status "mlx_diagonal")
+     (mem/deserialize-from res ::array))))
+
+;; ---------------------------------------------------------------------------
+;; Linear algebra ops
+;; ---------------------------------------------------------------------------
+
+;; cholesky: int mlx_linalg_cholesky(mlx_array* res, mlx_array a,
+;;                                   bool upper, mlx_stream s)
+(def ^:private raw-mlx-linalg-cholesky
+  (ffi/cfn "mlx_linalg_cholesky"
+           [::mem/pointer ::array ::mem/byte ::stream]
+           ::mem/int))
+
+(defn mlx-linalg-cholesky
+  "Compute Cholesky decomposition. Returns lower-triangular L by default."
+  ([a] (mlx-linalg-cholesky a false))
+  ([a upper]
+   (let [arena (mem/auto-arena)
+         res (mem/alloc-instance ::array arena)
+         status (raw-mlx-linalg-cholesky res a (if upper (byte 1) (byte 0)) default-stream)]
+     (check-status! status "mlx_linalg_cholesky")
+     (mem/deserialize-from res ::array))))
+
+;; solve_triangular: int mlx_linalg_solve_triangular(mlx_array* res,
+;;   mlx_array a, mlx_array b, bool upper, mlx_stream s)
+(def ^:private raw-mlx-linalg-solve-triangular
+  (ffi/cfn "mlx_linalg_solve_triangular"
+           [::mem/pointer ::array ::array ::mem/byte ::stream]
+           ::mem/int))
+
+(defn mlx-linalg-solve-triangular
+  "Solve triangular system A x = b. Default: lower-triangular."
+  ([a b] (mlx-linalg-solve-triangular a b false))
+  ([a b upper]
+   (let [arena (mem/auto-arena)
+         res (mem/alloc-instance ::array arena)
+         status (raw-mlx-linalg-solve-triangular res a b
+                                                  (if upper (byte 1) (byte 0))
+                                                  default-stream)]
+     (check-status! status "mlx_linalg_solve_triangular")
+     (mem/deserialize-from res ::array))))
+
+;; ---------------------------------------------------------------------------
 ;; Vector array operations
 ;; ---------------------------------------------------------------------------
 
@@ -603,6 +694,53 @@
         status (raw-mlx-compile res cls (if shapeless (byte 1) (byte 0)))]
     (check-status! status "mlx_compile")
     (mem/deserialize-from res ::closure)))
+
+;; ---------------------------------------------------------------------------
+;; Random number generation
+;; ---------------------------------------------------------------------------
+
+(def ^:private raw-random-key
+  "int mlx_random_key(mlx_array* res, uint64_t seed)"
+  (ffi/cfn "mlx_random_key"
+           [::mem/pointer ::mem/long]
+           ::mem/int))
+
+(def ^:private raw-random-normal
+  "int mlx_random_normal(mlx_array* res, const int* shape, size_t shape_num,
+                          mlx_dtype dtype, float loc, float scale,
+                          const mlx_array key, const mlx_stream s)"
+  (ffi/cfn "mlx_random_normal"
+           [::mem/pointer ::mem/pointer ::mem/long ::mem/int
+            ::mem/float ::mem/float ::array ::stream]
+           ::mem/int))
+
+(defn random-key
+  "Create an MLX random key from a seed. Returns ::array handle."
+  [seed]
+  (let [arena (mem/auto-arena)
+        res (mem/alloc-instance ::array arena)
+        status (raw-random-key res (long seed))]
+    (check-status! status "mlx_random_key")
+    (mem/deserialize-from res ::array)))
+
+(defn random-normal
+  "Sample from N(0,I) with given shape. Returns ::array handle.
+   Uses MLX's native random number generator."
+  [shape-vec key-arr]
+  (let [arena (mem/auto-arena)
+        ndim (count shape-vec)
+        shape-seg (mem/alloc (* 4 ndim) arena)
+        _ (dotimes [i ndim]
+            (.set (.reinterpret shape-seg (* 4 ndim))
+                  java.lang.foreign.ValueLayout/JAVA_INT
+                  (* i 4)
+                  (int (nth shape-vec i))))
+        res (mem/alloc-instance ::array arena)
+        status (raw-random-normal res shape-seg (long ndim) dtype-float32
+                                  (float 0.0) (float 1.0)
+                                  key-arr default-stream)]
+    (check-status! status "mlx_random_normal")
+    (mem/deserialize-from res ::array)))
 
 ;; ---------------------------------------------------------------------------
 ;; Fast-path shim — single FFI call for compiled closure application
