@@ -190,7 +190,7 @@
 (defn can-project?
   "Returns true if `t` satisfies the [[IProject]] protocol, false otherwise."
   [t]
-  (instance? IProject t))
+  (satisfies? IProject t))
 
 (defn can-update?
   "Returns true if `t` satisfies the [[IUpdate]] protocol, false otherwise."

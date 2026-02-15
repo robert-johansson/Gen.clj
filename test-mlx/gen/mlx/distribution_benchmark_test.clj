@@ -181,3 +181,38 @@
                                          (arr/eval! (first grads))))]
         (print-row (str "batch grad N=" n ":") batch-ns)))
     (println)))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 4: New distributions — scalar logpdf comparison
+;; ---------------------------------------------------------------------------
+
+(deftest ^:benchmark new-distributions-scalar-comparison
+  (testing "New distributions: MLX vs kixi scalar logpdf"
+    (println)
+    (println "--- New distributions: scalar logpdf ---")
+    (let [v 0.5
+          ;; Exponential
+          kixi-exp   (kixi/exponential-distribution 2.0)
+          mlx-exp    (mlx-dist/exponential-distribution 2.0)
+          kixi-exp-ns (bench 1000 100000 #(d/logpdf kixi-exp v))
+          mlx-exp-ns  (bench 1000 10000  #(d/logpdf mlx-exp v))
+          ;; Uniform
+          kixi-uni   (kixi/uniform-distribution 0.0 1.0)
+          mlx-uni    (mlx-dist/uniform-distribution 0.0 1.0)
+          kixi-uni-ns (bench 1000 100000 #(d/logpdf kixi-uni v))
+          mlx-uni-ns  (bench 1000 10000  #(d/logpdf mlx-uni v))
+          ;; Cauchy
+          kixi-cau   (kixi/cauchy-distribution 0.0 1.0)
+          mlx-cau    (mlx-dist/cauchy-distribution 0.0 1.0)
+          kixi-cau-ns (bench 1000 100000 #(d/logpdf kixi-cau v))
+          mlx-cau-ns  (bench 1000 10000  #(d/logpdf mlx-cau v))
+          ;; Laplace
+          mlx-lap    (mlx-dist/laplace-distribution 0.0 1.0)
+          mlx-lap-ns  (bench 1000 10000  #(d/logpdf mlx-lap v))]
+      (printf "  %-24s %15s %15s%n" "Distribution" "kixi" "mlx")
+      (printf "  %-24s %15s %15s%n" "---" "---" "---")
+      (printf "  %-24s %15s %15s%n" "Exponential(2)" (format-ns kixi-exp-ns) (format-ns mlx-exp-ns))
+      (printf "  %-24s %15s %15s%n" "Uniform(0,1)" (format-ns kixi-uni-ns) (format-ns mlx-uni-ns))
+      (printf "  %-24s %15s %15s%n" "Cauchy(0,1)" (format-ns kixi-cau-ns) (format-ns mlx-cau-ns))
+      (printf "  %-24s %15s %15s%n" "Laplace(0,1)" "N/A" (format-ns mlx-lap-ns))
+      (println))))

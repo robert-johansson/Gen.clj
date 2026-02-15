@@ -224,3 +224,127 @@
       (is (vector? grads))
       (is (close? expected-dmu (arr/->double (first grads))))
       (is (close? expected-dsigma (arr/->double (second grads)))))))
+
+;; ---------------------------------------------------------------------------
+;; New distribution tests: Exponential, Uniform, Laplace, Cauchy
+;; ---------------------------------------------------------------------------
+
+(deftest exponential-logpdf-vs-kixi
+  (testing "MLX Exponential matches kixi"
+    (doseq [[rate v] [[1.0 0.5]
+                       [2.0 1.0]
+                       [0.5 3.0]
+                       [3.0 0.1]]]
+      (let [kixi-val (d/logpdf (kixi/exponential-distribution rate) v)
+            mlx-val  (d/logpdf (mlx-dist/exponential-distribution rate) v)]
+        (is (close? kixi-val mlx-val 1e-3)
+            (str "Exponential(" rate ") at v=" v
+                 " kixi=" kixi-val " mlx=" mlx-val))))))
+
+(deftest exponential-sample-test
+  (testing "Exponential sampling produces positive values"
+    (let [dist (mlx-dist/exponential-distribution 2.0)]
+      (dotimes [_ 20]
+        (is (pos? (d/sample dist)))))))
+
+(deftest exponential-gradient-test
+  (testing "d/drate[logpdf(Exp(rate), v)] = 1/rate - v"
+    (doseq [[rate v] [[1.0 0.5] [2.0 1.0] [0.5 3.0]]]
+      (let [expected (- (/ 1.0 rate) v)
+            grad-fn  (xforms/grad
+                      (fn [rate-arr]
+                        (mlx-dist/exponential-logpdf rate-arr (arr/scalar v))))
+            actual   (arr/->double (grad-fn (arr/scalar rate)))]
+        (is (close? expected actual 1e-3)
+            (str "d/drate at rate=" rate " v=" v))))))
+
+(deftest uniform-logpdf-vs-kixi
+  (testing "MLX Uniform matches kixi"
+    (doseq [[lo hi v] [[0.0 1.0 0.5]
+                        [0.0 1.0 0.0]
+                        [0.0 1.0 1.0]
+                        [-1.0 1.0 0.0]
+                        [2.0 5.0 3.5]]]
+      (let [kixi-val (d/logpdf (kixi/uniform-distribution lo hi) v)
+            mlx-val  (d/logpdf (mlx-dist/uniform-distribution lo hi) v)]
+        (is (close? kixi-val mlx-val 1e-3)
+            (str "Uniform(" lo "," hi ") at v=" v
+                 " kixi=" kixi-val " mlx=" mlx-val))))))
+
+(deftest uniform-out-of-bounds
+  (testing "Uniform returns -Inf outside bounds"
+    (is (= ##-Inf (d/logpdf (mlx-dist/uniform-distribution 0.0 1.0) 2.0)))
+    (is (= ##-Inf (d/logpdf (mlx-dist/uniform-distribution 0.0 1.0) -0.1)))))
+
+(deftest uniform-sample-test
+  (testing "Uniform sampling is in bounds"
+    (let [dist (mlx-dist/uniform-distribution 2.0 5.0)]
+      (dotimes [_ 20]
+        (let [v (d/sample dist)]
+          (is (and (<= 2.0 v) (<= v 5.0))))))))
+
+(deftest cauchy-logpdf-vs-kixi
+  (testing "MLX Cauchy matches kixi"
+    (doseq [[loc scale v] [[0.0 1.0 0.0]
+                             [0.0 1.0 1.0]
+                             [0.0 1.0 -1.0]
+                             [1.0 2.0 0.5]
+                             [-3.0 0.5 -2.5]]]
+      (let [kixi-val (d/logpdf (kixi/cauchy-distribution loc scale) v)
+            mlx-val  (d/logpdf (mlx-dist/cauchy-distribution loc scale) v)]
+        (is (close? kixi-val mlx-val 1e-3)
+            (str "Cauchy(" loc "," scale ") at v=" v
+                 " kixi=" kixi-val " mlx=" mlx-val))))))
+
+(deftest cauchy-gradient-test
+  (testing "d/dv[logpdf(Cauchy(0,1), v)] = -2v / (1+v²)"
+    (doseq [v [0.0 0.5 1.0 -1.0 2.0]]
+      (let [expected (/ (* -2.0 v) (+ 1.0 (* v v)))
+            grad-fn  (xforms/grad
+                      (fn [v-arr]
+                        (mlx-dist/cauchy-logpdf (arr/scalar 0.0) (arr/scalar 1.0) v-arr)))
+            actual   (arr/->double (grad-fn (arr/scalar v)))]
+        (is (close? expected actual 1e-3)
+            (str "d/dv at v=" v))))))
+
+(deftest laplace-logpdf-spot-checks
+  (testing "Laplace logpdf spot checks"
+    ;; logpdf(Laplace(0,1), 0) = -log(2*1) - |0-0|/1 = -log(2) ≈ -0.693
+    (is (close? (- (Math/log 2.0))
+                (d/logpdf (mlx-dist/laplace-distribution 0.0 1.0) 0.0)
+                1e-3))
+    ;; logpdf(Laplace(0,1), 1) = -log(2) - 1 ≈ -1.693
+    (is (close? (- (- (Math/log 2.0)) 1.0)
+                (d/logpdf (mlx-dist/laplace-distribution 0.0 1.0) 1.0)
+                1e-3))))
+
+(deftest laplace-gradient-test
+  (testing "d/dv[logpdf(Laplace(0,1), v)] = -sign(v) for v≠0"
+    ;; At v=1.0: gradient = -sign(1) = -1
+    (let [grad-fn (xforms/grad
+                   (fn [v-arr]
+                     (mlx-dist/laplace-logpdf (arr/scalar 0.0) (arr/scalar 1.0) v-arr)))
+          actual  (arr/->double (grad-fn (arr/scalar 1.0)))]
+      (is (close? -1.0 actual 1e-3)))
+    ;; At v=-2.0: gradient = -sign(-2) = 1
+    (let [grad-fn (xforms/grad
+                   (fn [v-arr]
+                     (mlx-dist/laplace-logpdf (arr/scalar 0.0) (arr/scalar 1.0) v-arr)))
+          actual  (arr/->double (grad-fn (arr/scalar -2.0)))]
+      (is (close? 1.0 actual 1e-3)))))
+
+(deftest generate-weight-new-distributions
+  (testing "gf/generate works with new distribution generative functions"
+    (let [constraint (choicemap/choicemap 0.5)]
+      ;; Exponential
+      (let [result (gf/generate mlx-dist/exponential [1.0] constraint)]
+        (is (number? (:weight result))))
+      ;; Uniform
+      (let [result (gf/generate mlx-dist/uniform [0.0 1.0] constraint)]
+        (is (number? (:weight result))))
+      ;; Cauchy
+      (let [result (gf/generate mlx-dist/cauchy [0.0 1.0] constraint)]
+        (is (number? (:weight result))))
+      ;; Laplace
+      (let [result (gf/generate mlx-dist/laplace [0.0 1.0] constraint)]
+        (is (number? (:weight result)))))))

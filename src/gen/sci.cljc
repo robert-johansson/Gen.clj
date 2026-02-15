@@ -11,6 +11,8 @@
             [gen.dynamic]
             [gen.generative-function]
             [gen.inference.importance]
+            [gen.inference.mh]
+            [gen.selection]
             [gen.trace]
             [sci.core :as sci]
             [sci.ctx-store]))
@@ -38,6 +40,8 @@
                                                     'untraced untraced-macro))
    'gen.generative-function              (sci/copy-ns gen.generative-function (sci/create-ns 'gen.generative-function))
    'gen.inference.importance             (sci/copy-ns gen.inference.importance (sci/create-ns 'gen.inference.importance))
+   'gen.inference.mh                     (sci/copy-ns gen.inference.mh (sci/create-ns 'gen.inference.mh))
+   'gen.selection                        (sci/copy-ns gen.selection (sci/create-ns 'gen.selection))
    'gen.trace                            (sci/copy-ns gen.trace (sci/create-ns 'gen.trace))})
 
 (def config

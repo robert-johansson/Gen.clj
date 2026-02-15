@@ -4,6 +4,7 @@
             [gen.choicemap :as choicemap]
             [gen.diff :as diff]
             [gen.generative-function :as gf]
+            [gen.selection :as selection]
             [gen.trace :as trace])
   #?(:clj
      (:import (clojure.lang Associative IFn IObj IPersistentMap
@@ -58,7 +59,10 @@
   (-has-value? [_] false)
   (-get-value [_] nil)
   (has-submap? [_ k] (contains? m k))
-  (get-submap [this k] (.invoke ^IFn this k choicemap/EMPTY))
+  (get-submap [_ k]
+    (if-let [v (get m k)]
+      (trace/get-choices (:subtrace v))
+      choicemap/EMPTY))
 
   (get-values-shallow [_]
     (persistent!
@@ -102,7 +106,7 @@
        (assoc [_ _ _]
               (throw
                (ex-info "ChoiceMap instances are read-only." {})))
-       (without [m k]
+       (without [_ k]
                 (ChoiceMap. (dissoc m k)))
 
        Associative
@@ -191,7 +195,7 @@
   (pprint/simple-dispatch
    (choicemap/get-submaps-shallow cm)))
 
-(deftype Trace [gen-fn trie score noise args retval]
+(defrecord Trace [gen-fn trie score noise args retval]
   trace/ITrace
   (get-args [_] args)
   (get-retval [_] retval)
@@ -201,60 +205,39 @@
 
 #?(:clj
    (defmethod print-method Trace
-     [^Trace t ^java.io.Writer w]
+     [t ^java.io.Writer w]
      (print-method (trace/trace->map t) w)))
 
-(defmethod pprint/simple-dispatch Trace [^Trace t]
+(defmethod pprint/simple-dispatch Trace [t]
   (pprint/simple-dispatch (trace/trace->map t)))
 
 (defn trace
-  "Returns a new bare trace.
-
-  TODO pad args with defaults if available."
+  "Returns a new bare trace."
   [gen-fn args]
-  (Trace. gen-fn {} 0.0 0.0 args nil))
+  (->Trace gen-fn {} 0.0 0.0 args nil))
 
 (defn validate-empty!
-  [^Trace trace addr]
-  (when (contains? (.-trie trace) addr)
+  [trace addr]
+  (when (contains? (:trie trace) addr)
     (throw
      (ex-info
       "Subtrace already present at address. The same address cannot be reused
       for multiple random choices."
       {:addr addr}))))
 
-(defn with-retval [^Trace trace retval]
-  (Trace. (.-gen-fn trace)
-          (.-trie trace)
-          (.-score trace)
-          (.-noise trace)
-          (.-args trace)
-          retval))
+(defn with-retval [trace retval]
+  (assoc trace :retval retval))
 
 (defn add-call
-  "TODO handle noise."
-  [^Trace trace k subtrace]
+  [trace k subtrace]
   (validate-empty! trace k)
-  (let [trie (.-trie trace)
-        score (trace/get-score subtrace)
-        noise 0.0 #_ (trace/project subtrace nil)
+  (let [score (trace/get-score subtrace)
+        noise 0.0
         call  (->Call subtrace score noise)]
-    (Trace. (.-gen-fn trace)
-            (assoc trie k call)
-            (+ (.-score trace) score)
-            (+ (.-noise trace) noise)
-            (.-args trace)
-            (.-retval trace))))
-
-(defn ^:no-doc trace:= [^Trace this that]
-  (and (instance? Trace that)
-       (let [^Trace that that]
-         (and (= (.-gen-fn this) (.-gen-fn that))
-              (= (.-trie this) (.-trie that))
-              (= (.-score this) (.-score that))
-              (= (.-noise this) (.-noise that))
-              (= (.-args this) (.-args that))
-              (= (.-retval this) (.-retval that))))))
+    (-> trace
+        (update :trie assoc k call)
+        (update :score + score)
+        (update :noise + noise))))
 
 ;; ## Update State
 (defn ^:no-doc combine
@@ -275,11 +258,11 @@
 ;; TODO can we add exec to the protocol? NO but we can do `exec` if we move all
 ;; this nonsense into `gen.dynamic`... that would work!
 
-(defn ^:no-doc extract-unvisited [^Trace prev-trace new-trace]
+(defn ^:no-doc extract-unvisited [prev-trace new-trace]
   (let [visited-m (choicemap/get-submaps-shallow
                    (trace/get-choices new-trace))
         unvisited-trie (apply dissoc
-                              (.-trie prev-trace)
+                              (:trie prev-trace)
                               (keys visited-m))
         to-subtract (reduce-kv (fn [acc _ v] (+ acc (:score v)))
                                0.0
@@ -287,11 +270,11 @@
 
     [to-subtract (->ChoiceMap unvisited-trie)]))
 
-(defn assert-all-visited! [^Trace trace constraints]
+(defn assert-all-visited! [trace constraints]
   (when-let [unvisited (keys
                         (apply dissoc
                                (choicemap/get-submaps-shallow constraints)
-                               (keys (.-trie trace))))]
+                               (keys (:trie trace))))]
     (throw (ex-info "Some constraints weren't visited: "
                     {:unvisited unvisited}))))
 
@@ -317,7 +300,7 @@
                     ;; TODO this is a spot where we'll need to check the
                     ;; previous value.
                     (if-let [prev-subtrace (:subtrace
-                                            (get (.-trie this) k))]
+                                            (get (:trie this) k))]
                       (do
                         (assert
                          (= gen-fn (trace/get-gen-fn prev-subtrace))
@@ -336,8 +319,16 @@
            :weight  (- weight to-subtract)
            :discard (choicemap/merge discard unvisited)})))))
 
-;; so we are going to remove the score of the unvisited stuff as we go up. Does
-;; that work?
+(extend-type Trace
+  trace/IProject
+  (project [this sel]
+    (reduce-kv
+     (fn [acc k {:keys [subtrace]}]
+       (if (selection/includes? sel k)
+         (+ acc (trace/project subtrace (selection/get-subselection sel k)))
+         acc))
+     0.0
+     (:trie this))))
 
 (defrecord DynamicDSLFunction [clojure-fn has-argument-grads accepts-output-grad?]
   gf/IGenerativeFunction
@@ -456,8 +447,8 @@
        (-invoke [_ x1 x2 x3 x4 x5 x6 x7 x8 x9 x10 x11 x12 x13 x14 x15 x16 x17 x18 x19 x20 xs]
                 (untraced (apply clojure-fn x1 x2 x3 x4 x5 x6 x7 x8 x9 x10 x11 x12 x13 x14 x15 x16 x17 x18 x19 x20 xs)))]))
 
-(defn ^:no-doc apply-inner [^DynamicDSLFunction gf args]
-  (apply (.-clojure-fn gf) args))
+(defn ^:no-doc apply-inner [gf args]
+  (apply (:clojure-fn gf) args))
 
 ;; The following two functions use a brittle form of macro-rewriting; we should
 ;; really look at the namespace and local macro environments to try and see if a
@@ -561,12 +552,50 @@
                   ([gf args]
                    (apply-inner gf args))
                   ([k gf args]
-                   (let [{:keys [submap weight retval]} (gf/propose gf args)]
+                   (let [{:keys [choices weight retval]} (gf/propose gf args)]
                      (swap! !state
                             (fn [m]
                               (-> m
-                                  (update :choices assoc k submap)
+                                  (update :choices assoc k choices)
                                   (update :weight + weight))))
                      retval)))]
         (let [retval (apply-inner gf args)]
-          (assoc @!state :retval retval))))))
+          (assoc @!state :retval retval)))))
+
+  gf/IRegenerate
+  (-regenerate [gf old-trace args _argdiffs sel]
+    (let [old-trie (:trie old-trace)
+          !trace   (atom (trace gf args))]
+      (binding [*trace*
+                (fn
+                  ([inner-gf inner-args]
+                   (apply-inner inner-gf inner-args))
+                  ([k inner-gf inner-args]
+                   (validate-empty! @!trace k)
+                   (let [selected? (selection/includes? sel k)
+                         prev-call (get old-trie k)]
+                     (if (and (not selected?) prev-call)
+                       ;; Not selected + exists: keep old subtrace
+                       (let [subtrace (:subtrace prev-call)]
+                         (swap! !trace add-call k subtrace)
+                         (trace/get-retval subtrace))
+                       ;; Selected or new: simulate fresh
+                       (let [subtrace (gf/simulate inner-gf inner-args)]
+                         (swap! !trace add-call k subtrace)
+                         (trace/get-retval subtrace))))))]
+        (let [retval    (apply-inner gf args)
+              new-trace (with-retval @!trace retval)
+              old-score (trace/get-score old-trace)
+              new-score (trace/get-score new-trace)
+              ;; weight = new_score - old_score - (project_new_sel - project_old_sel)
+              ;; For prior regenerate: project_new_sel = score of selected choices in new trace
+              ;; project_old_sel = score of selected choices in old trace
+              ;; weight = (new_score - project_new_sel) - (old_score - project_old_sel)
+              ;; which simplifies to: sum of unselected scores cancels
+              new-sel-score (trace/project new-trace sel)
+              old-sel-score (trace/project old-trace sel)
+              weight (- (- new-score new-sel-score)
+                        (- old-score old-sel-score))]
+          {:trace  new-trace
+           :weight weight
+           :change diff/unknown-change})))))

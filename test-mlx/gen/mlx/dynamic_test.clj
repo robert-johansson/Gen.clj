@@ -190,3 +190,40 @@
           m           (mean slope-vals)]
       (is (close? 2.1 m 1.0)
           (str "posterior slope mean should be ~2.1, got " m)))))
+
+;; ---------------------------------------------------------------------------
+;; 9. Mixed-distribution model — tests generalized build-score-fn
+;; ---------------------------------------------------------------------------
+
+(def mixed-model
+  (mlx-dyn/gen []
+    (let [x (dynamic/trace! :x mlx-dist/normal 0.0 1.0)]
+      (dynamic/trace! :rate mlx-dist/exponential (Math/exp x)))))
+
+(deftest mixed-distribution-simulate
+  (testing "simulate works with mixed distributions"
+    (let [tr (gf/simulate mixed-model [])]
+      (is (number? (trace/get-score tr)))
+      (let [cm (trace/get-choices tr)]
+        (is (choicemap/has-value? cm :x))
+        (is (choicemap/has-value? cm :rate))))))
+
+(deftest mixed-distribution-generate
+  (testing "generate with constraints on mixed distributions"
+    (let [constraints (choicemap/choicemap {:x 0.5 :rate 1.0})
+          result      (gf/generate mixed-model [] constraints)]
+      (is (number? (:weight result)))
+      ;; Weight should be sum of logpdfs
+      (let [lp-x    (d/logpdf (mlx-dist/normal-distribution 0.0 1.0) 0.5)
+            lp-rate (d/logpdf (mlx-dist/exponential-distribution (Math/exp 0.5)) 1.0)]
+        (is (close? (+ lp-x lp-rate) (:weight result))
+            "weight should be sum of individual logpdfs")))))
+
+(deftest mixed-distribution-choice-gradients
+  (testing "choice-gradients work with mixed distributions"
+    (let [constraints (choicemap/choicemap {:x 0.5 :rate 1.0})
+          result      (gf/generate mixed-model [] constraints)
+          grads       (trace/choice-gradients (:trace result) nil nil)]
+      (is (some? (:choice-grads grads)))
+      (is (choicemap/has-submap? (:choice-grads grads) :x))
+      (is (choicemap/has-submap? (:choice-grads grads) :rate)))))

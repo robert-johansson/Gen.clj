@@ -121,40 +121,200 @@
 ;; build-score-fn — vectorized two-phase replay
 ;;
 ;; Phase 1 (JVM): replay model with JVM doubles extracted from input vector
-;;   to collect distribution parameters at each address.
-;; Phase 2 (MLX): one vectorized gaussian-logpdf + arr/sum.
+;;   to collect distribution parameters + distribution type at each address.
+;; Phase 2 (MLX): group by distribution type, vectorized logpdf per group.
 ;;
-;; This batches ~6N FFI ops down to ~6 regardless of N choices.
+;; O(D) groups of FFI calls where D = number of distinct distribution types.
+;; Fast path: when all addresses use same distribution, skip masking.
 ;; ---------------------------------------------------------------------------
+
+(defn- build-dist-instance
+  "Build a distribution instance from a dist-gf and args, used for mlx-logpdf."
+  [dist-gf dist-args]
+  (apply (:ctor dist-gf) dist-args))
 
 (defn build-score-fn
   "Build a pure function (MLXArray -> MLXArray) that computes the total
    log-probability of all choices. Takes a single MLXArray vector of
    choice values (ordered by sorted-addrs) and returns a scalar MLXArray.
 
-   Phase 1 replays the model in JVM to collect dist params (which may
-   depend on earlier choices). Phase 2 computes all logpdfs in one
-   vectorized MLX call."
+   Phase 1 replays the model in JVM to collect dist params and types.
+   Phase 2 groups by distribution type and computes vectorized logpdfs."
   [gf model-args sorted-addrs]
   (fn [values-arr]
-    ;; Phase 1: extract JVM doubles, replay model to collect dist params
+    ;; Phase 1: extract JVM doubles, replay model to collect dist params + types
     (let [jvm-vals  (arr/->vec values-arr)
           addr->jvm (zipmap sorted-addrs jvm-vals)
-          !params   (volatile! [])]
+          !entries  (volatile! [])]
       (binding [dynamic/*trace*
                 (fn
                   ([inner-gf inner-args]
                    (apply (.-clojure-fn ^MLXDynamicDSLFunction inner-gf)
                           inner-args))
-                  ([k _dist-gf dist-args]
-                   (vswap! !params conj (vec dist-args))
+                  ([k dist-gf dist-args]
+                   (vswap! !entries conj {:dist-gf dist-gf
+                                          :dist-args (vec dist-args)})
                    (get addr->jvm k)))]
         (apply (.-clojure-fn ^MLXDynamicDSLFunction gf) model-args))
-      ;; Phase 2: vectorized logpdf
-      (let [params @!params
-            mus    (arr/from-vec (mapv #(double (first %)) params))
-            sigmas (arr/from-vec (mapv #(double (second %)) params))]
-        (arr/sum (mlx-dist/gaussian-logpdf mus sigmas values-arr))))))
+      ;; Phase 2: group by distribution type, vectorized logpdf per group
+      (let [entries @!entries
+            n       (count entries)
+            tags    (mapv (fn [{:keys [dist-gf dist-args]}]
+                            (let [dist (build-dist-instance dist-gf dist-args)]
+                              (if (satisfies? mlx-dist/IMLXLogPDF dist)
+                                (mlx-dist/dist-tag dist)
+                                :fallback)))
+                          entries)
+            distinct-tags (distinct tags)]
+        (if (and (= 1 (count distinct-tags))
+                 (not= :fallback (first distinct-tags)))
+          ;; Fast path: all same distribution type, no masking needed
+          (let [tag       (first distinct-tags)
+                dist0     (build-dist-instance (:dist-gf (first entries))
+                                               (:dist-args (first entries)))
+                _         (assert (satisfies? mlx-dist/IMLXLogPDF dist0))
+                ;; For same-type distributions, build param vectors and
+                ;; call the vectorized logpdf from the first instance's type
+                ;; We need to build dist instances for each entry to get their params
+                dists     (mapv (fn [{:keys [dist-gf dist-args]}]
+                                 (build-dist-instance dist-gf dist-args))
+                               entries)]
+            ;; Dispatch by tag — each type knows how to vectorize itself
+            (case tag
+              :normal
+              (let [mus    (arr/from-vec (mapv #(double (:mu %)) dists))
+                    sigmas (arr/from-vec (mapv #(double (:sigma %)) dists))]
+                (arr/sum (mlx-dist/gaussian-logpdf mus sigmas values-arr)))
+
+              :exponential
+              (let [rates (arr/from-vec (mapv #(double (:rate %)) dists))]
+                (arr/sum (mlx-dist/exponential-logpdf rates values-arr)))
+
+              :uniform
+              (let [los (arr/from-vec (mapv #(double (:lo %)) dists))
+                    his (arr/from-vec (mapv #(double (:hi %)) dists))]
+                (arr/sum (mlx-dist/uniform-logpdf los his values-arr)))
+
+              :laplace
+              (let [locs   (arr/from-vec (mapv #(double (:location %)) dists))
+                    scales (arr/from-vec (mapv #(double (:scale %)) dists))]
+                (arr/sum (mlx-dist/laplace-logpdf locs scales values-arr)))
+
+              :cauchy
+              (let [locs   (arr/from-vec (mapv #(double (:location %)) dists))
+                    scales (arr/from-vec (mapv #(double (:scale %)) dists))]
+                (arr/sum (mlx-dist/cauchy-logpdf locs scales values-arr)))))
+
+          ;; General path: group by type, mask per group, sum
+          (reduce
+           (fn [total tag]
+             (let [mask-vec   (mapv (fn [t] (if (= t tag) 1.0 0.0)) tags)
+                   mask-arr   (arr/from-vec mask-vec)
+                   group-idxs (keep-indexed (fn [i t] (when (= t tag) i)) tags)]
+               (if (= tag :fallback)
+                 ;; Fallback: compute scalar logpdfs and sum
+                 (let [fallback-sum
+                       (reduce
+                        (fn [acc i]
+                          (let [{:keys [dist-gf dist-args]} (nth entries i)
+                                dist (build-dist-instance dist-gf dist-args)
+                                v    (nth jvm-vals i)]
+                            (+ acc (double (d/logpdf dist v)))))
+                        0.0
+                        group-idxs)]
+                   (arr/add total (arr/scalar fallback-sum)))
+                 ;; Vectorized path for this distribution type
+                 (let [dists (mapv (fn [i]
+                                    (let [{:keys [dist-gf dist-args]} (nth entries i)]
+                                      (build-dist-instance dist-gf dist-args)))
+                                  group-idxs)
+                       ;; Build full-size param vectors with safe defaults at non-group positions
+                       sample-dist (first dists)]
+                   (case tag
+                     :normal
+                     (let [mus    (arr/from-vec (mapv (fn [i t]
+                                                       (if (= t tag)
+                                                         (double (:mu (build-dist-instance
+                                                                       (:dist-gf (nth entries i))
+                                                                       (:dist-args (nth entries i)))))
+                                                         0.0))
+                                                     (range n) tags))
+                           sigmas (arr/from-vec (mapv (fn [i t]
+                                                       (if (= t tag)
+                                                         (double (:sigma (build-dist-instance
+                                                                          (:dist-gf (nth entries i))
+                                                                          (:dist-args (nth entries i)))))
+                                                         1.0))
+                                                     (range n) tags))]
+                       (arr/add total (arr/sum (arr/mul mask-arr
+                                                       (mlx-dist/gaussian-logpdf mus sigmas values-arr)))))
+
+                     :exponential
+                     (let [rates (arr/from-vec (mapv (fn [i t]
+                                                      (if (= t tag)
+                                                        (double (:rate (build-dist-instance
+                                                                        (:dist-gf (nth entries i))
+                                                                        (:dist-args (nth entries i)))))
+                                                        1.0))
+                                                    (range n) tags))]
+                       (arr/add total (arr/sum (arr/mul mask-arr
+                                                       (mlx-dist/exponential-logpdf rates values-arr)))))
+
+                     :uniform
+                     (let [los (arr/from-vec (mapv (fn [i t]
+                                                    (if (= t tag)
+                                                      (double (:lo (build-dist-instance
+                                                                     (:dist-gf (nth entries i))
+                                                                     (:dist-args (nth entries i)))))
+                                                      0.0))
+                                                  (range n) tags))
+                           his (arr/from-vec (mapv (fn [i t]
+                                                    (if (= t tag)
+                                                      (double (:hi (build-dist-instance
+                                                                     (:dist-gf (nth entries i))
+                                                                     (:dist-args (nth entries i)))))
+                                                      1.0))
+                                                  (range n) tags))]
+                       (arr/add total (arr/sum (arr/mul mask-arr
+                                                       (mlx-dist/uniform-logpdf los his values-arr)))))
+
+                     :laplace
+                     (let [locs (arr/from-vec (mapv (fn [i t]
+                                                     (if (= t tag)
+                                                       (double (:location (build-dist-instance
+                                                                            (:dist-gf (nth entries i))
+                                                                            (:dist-args (nth entries i)))))
+                                                       0.0))
+                                                   (range n) tags))
+                           scales (arr/from-vec (mapv (fn [i t]
+                                                       (if (= t tag)
+                                                         (double (:scale (build-dist-instance
+                                                                           (:dist-gf (nth entries i))
+                                                                           (:dist-args (nth entries i)))))
+                                                         1.0))
+                                                     (range n) tags))]
+                       (arr/add total (arr/sum (arr/mul mask-arr
+                                                       (mlx-dist/laplace-logpdf locs scales values-arr)))))
+
+                     :cauchy
+                     (let [locs (arr/from-vec (mapv (fn [i t]
+                                                     (if (= t tag)
+                                                       (double (:location (build-dist-instance
+                                                                            (:dist-gf (nth entries i))
+                                                                            (:dist-args (nth entries i)))))
+                                                       0.0))
+                                                   (range n) tags))
+                           scales (arr/from-vec (mapv (fn [i t]
+                                                       (if (= t tag)
+                                                         (double (:scale (build-dist-instance
+                                                                           (:dist-gf (nth entries i))
+                                                                           (:dist-args (nth entries i)))))
+                                                         1.0))
+                                                     (range n) tags))]
+                       (arr/add total (arr/sum (arr/mul mask-arr
+                                                       (mlx-dist/cauchy-logpdf locs scales values-arr))))))))))
+           (arr/scalar 0.0)
+           distinct-tags))))))
 
 ;; ---------------------------------------------------------------------------
 ;; IChoiceGradients

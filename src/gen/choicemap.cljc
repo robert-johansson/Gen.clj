@@ -329,7 +329,7 @@
        (assoc [_ k v]
               (DynamicChoiceMap.
                (assoc m k (choicemap v))))
-       (without [m k] (DynamicChoiceMap. (dissoc m k)))
+       (without [_ k] (DynamicChoiceMap. (dissoc m k)))
 
        Associative
        (containsKey [_ k] (contains? m k))

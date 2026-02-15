@@ -5,6 +5,7 @@
             [gen.choicemap :as choicemap]
             [gen.diff :as diff]
             [gen.generative-function :as gf]
+            [gen.selection] ;; needed for instance? check on AllSelection
             [gen.trace :as trace])
   #?(:clj
      (:import (clojure.lang IFn))))
@@ -87,7 +88,13 @@
         (-> (gf/generate gen-fn args current)
             (update :weight - score)
             (assoc :change  diff/no-change
-                   :discard choicemap/EMPTY))))))
+                   :discard choicemap/EMPTY)))))
+
+  trace/IProject
+  (project [_ selection]
+    (if (instance? gen.selection.AllSelection selection)
+      score
+      0.0)))
 
 #?(:clj
    (defmethod print-method Trace
@@ -247,3 +254,20 @@
                 (sample (ctor a b c d e f g h i j k l m n o p q r s t)))
        (-invoke [_ a b c d e f g h i j k l m n o p q r s t rest]
                 (sample (apply ctor a b c d e f g h i j k l m n o p q r s t rest)))]))
+
+(extend-type GenerativeFn
+  gf/IRegenerate
+  (-regenerate [this old-trace args _argdiffs selection]
+    (if (instance? gen.selection.AllSelection selection)
+      ;; Selected: resample from prior, weight = 0
+      (let [new-trace (gf/simulate this args)]
+        {:trace  new-trace
+         :weight 0.0
+         :change diff/unknown-change})
+      ;; Not selected: keep old value, recompute score with new args
+      (let [old-val  (:val old-trace)
+            dist     (apply (:ctor this) args)
+            new-score (logpdf dist old-val)]
+        {:trace  (->Trace this args old-val new-score)
+         :weight 0.0
+         :change diff/no-change}))))

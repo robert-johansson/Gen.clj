@@ -1,6 +1,5 @@
 (ns gen.inference.importance
   (:require [clojure.math :as math]
-            [gen.distribution.kixi :as dist]
             [gen.generative-function :as gf]))
 
 ;; This implementation comes from `fastmath.core`, ported here for cljc
@@ -28,17 +27,20 @@
 
 (defn resampling [gf args observations n-samples]
   ;; https://github.com/probcomp/Gen.jl/blob/master/src/inference/importance.jl#L77...L95
-  (let [result (gf/generate gf args observations)
-        model-trace (volatile! (:trace result))
-        log-total-weight (volatile! (:weight result))]
-    (dotimes [_ (dec n-samples)]
-      (let [candidate (gf/generate gf args observations)
-            candidate-model-trace (:trace candidate)
-            log-weight (:weight candidate)]
-        (when-not (neg-inf? log-weight)
-          (vswap! log-total-weight #(logsumexp [log-weight %]))
-          (when (dist/bernoulli (math/exp (- log-weight @log-total-weight)))
-            (vreset! model-trace candidate-model-trace)))))
-    (let [log-ml-estimate (- @log-total-weight (math/log n-samples))]
-      {:trace @model-trace
-       :weight log-ml-estimate})))
+  (let [first-result (gf/generate gf args observations)]
+    (loop [i                1
+           model-trace      (:trace first-result)
+           log-total-weight (:weight first-result)]
+      (if (< i n-samples)
+        (let [candidate (gf/generate gf args observations)
+              log-weight (:weight candidate)]
+          (if (neg-inf? log-weight)
+            (recur (inc i) model-trace log-total-weight)
+            (let [new-log-total (logsumexp [log-weight log-total-weight])
+                  accept-prob   (math/exp (- log-weight new-log-total))]
+              (if (< (rand) accept-prob)
+                (recur (inc i) (:trace candidate) new-log-total)
+                (recur (inc i) model-trace new-log-total)))))
+        (let [log-ml-estimate (- log-total-weight (math/log n-samples))]
+          {:trace  model-trace
+           :weight log-ml-estimate})))))

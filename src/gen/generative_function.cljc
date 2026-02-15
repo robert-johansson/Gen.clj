@@ -117,9 +117,9 @@
   [gf args]
   (let [trace  (simulate gf args)
         weight (trace/get-score trace)]
-    [(trace/get-choices trace)
-     weight
-     (trace/get-retval trace)]))
+    {:choices (trace/get-choices trace)
+     :weight  weight
+     :retval  (trace/get-retval trace)}))
 
 (extend-protocol IPropose
   #?(:clj Object :cljs default)
@@ -129,7 +129,8 @@
   "Default implementation of [[-assess]], built on [[generate]]."
   [gf args choices]
   (let [{:keys [trace weight]} (generate gf args choices)]
-    [weight (trace/get-retval trace)]))
+    {:weight weight
+     :retval (trace/get-retval trace)}))
 
 (extend-protocol IAssess
   #?(:clj Object :cljs default)
@@ -144,3 +145,27 @@
   ```"
   [gf args choices]
   (-assess gf args (choicemap/choicemap choices)))
+
+;; ## IRegenerate
+
+(defprotocol IRegenerate
+  (-regenerate [gf trace args argdiffs selection]
+    "Re-sample selected addresses from the prior, keep others fixed.
+     Returns a map of the form:
+
+     ```clojure
+     {:trace  <new-trace>
+      :weight <importance weight>
+      :change <diff>}
+     ```"))
+
+(defn regenerate
+  "Re-sample selected addresses from the prior, keep others fixed.
+   Returns `{:trace :weight :change}`."
+  ([trace selection]
+   (let [gf   (trace/get-gen-fn trace)
+         args (trace/get-args trace)]
+     (-regenerate gf trace args (repeat (count args) :no-change) selection)))
+  ([trace args argdiffs selection]
+   (let [gf (trace/get-gen-fn trace)]
+     (-regenerate gf trace args argdiffs selection))))
