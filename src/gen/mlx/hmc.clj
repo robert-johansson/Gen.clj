@@ -302,3 +302,77 @@
   [log-density-fn initial-position n-steps & {:keys [eps] :or {eps 0.01}}]
   (sample log-density-fn initial-position n-steps :L 1 :eps eps))
 
+;; ---------------------------------------------------------------------------
+;; Parallel chain HMC — N chains via manual batching on (N x D) arrays
+;; ---------------------------------------------------------------------------
+
+(defn parallel-sample
+  "Run N parallel HMC chains simultaneously via manual batching.
+
+   All chains share the same score function. Operations on (N x D) arrays
+   amortize FFI overhead across chains. The leapfrog integrator operates on
+   batched arrays — arithmetic broadcasts with scalar step sizes, and
+   value-and-grad produces (N, D) gradients.
+
+   Parameters:
+     total-score-fn     — (N, D) → scalar. Sum of all per-chain log-densities.
+                          Used by value-and-grad for gradient computation.
+     per-chain-score-fn — (N, D) → (N,). Per-chain log-densities.
+                          Used for Metropolis-Hastings accept/reject.
+     initial-positions  — (N, D) MLXArray.
+
+   Options:
+     :L   — leapfrog steps per HMC step (default 10)
+     :eps — leapfrog step size (default 0.01)
+
+   Returns vector of n-steps maps, each:
+     {:positions     (N, D) MLXArray — per-chain positions
+      :log-densities [N doubles]    — per-chain log-densities
+      :accepted      [N booleans]   — per-chain acceptance}"
+  [total-score-fn per-chain-score-fn initial-positions n-steps
+   & {:keys [L eps] :or {L 10 eps 0.01}}]
+  (let [vag-fn (xforms/value-and-grad total-score-fn)
+        vag-ctx (::xforms/vag-ctx (meta vag-fn))
+        [N D] (arr/shape initial-positions)
+        eps-arr (arr/scalar eps)
+        half-eps-arr (arr/scalar (/ eps 2.0))
+        init-ld (per-chain-score-fn initial-positions)]
+    (loop [i 0
+           pos initial-positions
+           ld init-ld
+           results (transient [])]
+      (if (>= i n-steps)
+        (persistent! results)
+        (let [;; Sample momentum for all chains: (N, D)
+              momentum (arr/random-normal [N D])
+              ;; Per-chain kinetic energy: (N,)
+              current-ke (arr/mul 0.5 (arr/sum-axis (arr/square momentum) 1))
+              ;; Per-chain Hamiltonian: (N,)
+              current-H (arr/sub current-ke ld)
+              ;; Leapfrog integration — operates on (N, D) arrays
+              ;; C shim works because arithmetic broadcasts with scalar step sizes
+              proposal (leapfrog-lazy vag-fn pos momentum eps-arr half-eps-arr L
+                                     :vag-ctx vag-ctx)
+              ;; Per-chain proposed quantities
+              proposed-ld (per-chain-score-fn (:position proposal))
+              proposed-ke (arr/mul 0.5 (arr/sum-axis (arr/square (:momentum proposal)) 1))
+              proposed-H (arr/sub proposed-ke proposed-ld)
+              ;; Per-chain MH accept/reject
+              log-accept (arr/sub current-H proposed-H)
+              log-u (arr/log (arr/random-uniform [N]))
+              accepted (arr/less log-u log-accept)
+              ;; Branchless select per chain — expand (N,) bool to (N, 1) for broadcasting
+              accepted-2d (arr/expand-dims accepted 1)
+              new-pos (arr/where accepted-2d (:position proposal) pos)
+              new-ld (arr/where accepted proposed-ld ld)
+              ;; Eval and extract results for this step
+              ld-vec (arr/->vec new-ld)
+              accepted-float (arr/where accepted 1.0 0.0)
+              accepted-vec (arr/->vec accepted-float)]
+          (recur (inc i)
+                 new-pos
+                 new-ld
+                 (conj! results {:positions new-pos
+                                 :log-densities ld-vec
+                                 :accepted (mapv #(> % 0.5) accepted-vec)})))))))
+

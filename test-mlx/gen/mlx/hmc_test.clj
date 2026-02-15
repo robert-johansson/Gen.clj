@@ -230,3 +230,75 @@
       (is (instance? gen.mlx.array.MLXArray (:position result)))
       (is (instance? gen.mlx.array.MLXArray (:momentum result)))
       (is (number? (:log-density result))))))
+
+;; ---------------------------------------------------------------------------
+;; 12. Parallel chain HMC — structure
+;; ---------------------------------------------------------------------------
+
+(deftest parallel-sample-structure
+  (testing "parallel-sample returns correct structure"
+    (let [;; Score function: 2D standard normal
+          ;; For (N, D) input, arr/sum gives scalar total
+          total-score (fn [X] (arr/mul -0.5 (arr/sum (arr/square X))))
+          ;; Per-chain score: sum-axis over dim 1 gives (N,)
+          per-chain-score (fn [X] (arr/mul -0.5 (arr/sum-axis (arr/square X) 1)))
+          ;; 4 chains, 2 dimensions
+          init-pos (arr/array [0 0 0 0 0 0 0 0] [4 2])
+          results (hmc/parallel-sample total-score per-chain-score
+                                        init-pos 5 :L 5 :eps 0.1)]
+      (is (= 5 (count results)))
+      (is (contains? (first results) :positions))
+      (is (contains? (first results) :log-densities))
+      (is (contains? (first results) :accepted))
+      (is (= [4 2] (arr/shape (:positions (first results)))))
+      (is (= 4 (count (:log-densities (first results)))))
+      (is (= 4 (count (:accepted (first results))))))))
+
+;; ---------------------------------------------------------------------------
+;; 13. Parallel chains — posterior statistics
+;; ---------------------------------------------------------------------------
+
+(deftest parallel-sample-posterior
+  (testing "parallel chains produce correct posterior statistics for 2D normal"
+    (let [total-score (fn [X] (arr/mul -0.5 (arr/sum (arr/square X))))
+          per-chain-score (fn [X] (arr/mul -0.5 (arr/sum-axis (arr/square X) 1)))
+          ;; 4 chains, 2 dimensions
+          init-pos (arr/array [0 0 0 0 0 0 0 0] [4 2])
+          results (hmc/parallel-sample total-score per-chain-score
+                                        init-pos 300 :L 10 :eps 0.1)
+          ;; Collect all samples from all chains (after burn-in)
+          samples (mapcat (fn [step]
+                            (let [flat (arr/->vec (:positions step))]
+                              (partition 2 flat)))
+                          (drop 50 results))
+          dim0 (map first samples)
+          dim1 (map second samples)]
+      ;; With 4 chains x 250 post-burnin steps = 1000 samples
+      (is (close? 0.0 (mean dim0) 0.3)
+          (str "dim0 mean should be ≈ 0, got " (mean dim0)))
+      (is (close? 1.0 (std dim0) 0.3)
+          (str "dim0 std should be ≈ 1, got " (std dim0)))
+      (is (close? 0.0 (mean dim1) 0.3)
+          (str "dim1 mean should be ≈ 0, got " (mean dim1)))
+      (is (close? 1.0 (std dim1) 0.3)
+          (str "dim1 std should be ≈ 1, got " (std dim1))))))
+
+;; ---------------------------------------------------------------------------
+;; 14. Parallel chains — acceptance rate
+;; ---------------------------------------------------------------------------
+
+(deftest parallel-sample-acceptance-rate
+  (testing "parallel chains have reasonable acceptance rate"
+    (let [total-score (fn [X] (arr/mul -0.5 (arr/sum (arr/square X))))
+          per-chain-score (fn [X] (arr/mul -0.5 (arr/sum-axis (arr/square X) 1)))
+          init-pos (arr/array [0 0 0 0 0 0 0 0] [4 2])
+          results (hmc/parallel-sample total-score per-chain-score
+                                        init-pos 100 :L 10 :eps 0.1)
+          ;; Count total acceptances across all chains
+          total-accepts (reduce + (map (fn [step]
+                                         (count (filter true? (:accepted step))))
+                                       results))
+          total-proposals (* 4 100)
+          rate (/ (double total-accepts) total-proposals)]
+      (is (> rate 0.2)
+          (str "acceptance rate should be > 20%, got " (* 100 rate) "%")))))

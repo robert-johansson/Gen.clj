@@ -302,3 +302,98 @@
           m           (mean values)]
       (is (close? 3.0 m 1.0)
           (str "NUTS with selection: mean should be ~3.0, got " m)))))
+
+;; ---------------------------------------------------------------------------
+;; 15. Parallel HMC — structure and chain count
+;; ---------------------------------------------------------------------------
+
+(deftest parallel-hmc-structure
+  (testing "parallel-hmc-sample returns N chains with correct structure"
+    (let [constraints (choicemap/choicemap {:x 3.0})
+          result      (gf/generate normal-model [] constraints)
+          n-chains    4
+          n-steps     10
+          chains      (mlx-dyn/parallel-hmc-sample (:trace result) n-chains n-steps
+                                                    :L 5 :eps 0.05)]
+      ;; Should have N chains
+      (is (= n-chains (count chains)))
+      ;; Each chain should have n-steps results
+      (doseq [chain chains]
+        (is (= n-steps (count chain)))
+        ;; Each result should have the right keys
+        (doseq [step chain]
+          (is (contains? step :position))
+          (is (contains? step :log-density))
+          (is (contains? step :accepted?))
+          (is (contains? step :choices))
+          (is (contains? step :trace))
+          (is (number? (:log-density step)))
+          (is (boolean? (:accepted? step)))
+          (is (contains? (:choices step) :x)))))))
+
+;; ---------------------------------------------------------------------------
+;; 16. Parallel HMC — posterior statistics
+;; ---------------------------------------------------------------------------
+
+(deftest parallel-hmc-posterior
+  (testing "parallel chains produce correct posterior for Normal(3, 0.5)"
+    (let [constraints (choicemap/choicemap {:x 3.0})
+          result      (gf/generate normal-model [] constraints)
+          n-chains    4
+          n-steps     300
+          chains      (mlx-dyn/parallel-hmc-sample (:trace result) n-chains n-steps
+                                                    :L 10 :eps 0.05)
+          ;; Collect all samples from all chains (after burn-in)
+          all-values  (mapcat (fn [chain]
+                                (mapv #(get (:choices %) :x) (drop 50 chain)))
+                              chains)
+          m           (mean all-values)
+          s           (std all-values)]
+      (is (close? 3.0 m 0.5)
+          (str "posterior mean should be ~3.0, got " m))
+      (is (close? 0.5 s 0.4)
+          (str "posterior std should be ~0.5, got " s)))))
+
+;; ---------------------------------------------------------------------------
+;; 17. Parallel HMC with selection
+;; ---------------------------------------------------------------------------
+
+(deftest parallel-hmc-with-selection
+  (testing "parallel HMC with selection only updates selected addresses"
+    (let [xs         [0.0 0.5 1.0]
+          ys         [1.0 2.0 3.0]
+          y-constraints (reduce (fn [m i] (assoc m (keyword (str "y" i)) (nth ys i)))
+                                {} (range 3))
+          constraints (choicemap/choicemap (merge {:slope 2.0 :intercept 1.0} y-constraints))
+          result      (gf/generate linreg-model-multi [xs] constraints)
+          n-chains    2
+          n-steps     20
+          chains      (mlx-dyn/parallel-hmc-sample (:trace result) n-chains n-steps
+                                                    :L 5 :eps 0.01
+                                                    :selection #{:slope :intercept})]
+      (is (= n-chains (count chains)))
+      ;; Observations should remain fixed in all chains
+      (doseq [chain chains]
+        (doseq [step chain]
+          (doseq [i (range 3)]
+            (let [y-addr (keyword (str "y" i))]
+              (is (close? (nth ys i) (get (:choices step) y-addr))
+                  (str y-addr " should remain fixed in parallel chain")))))))))
+
+;; ---------------------------------------------------------------------------
+;; 18. Parallel HMC — acceptance rate
+;; ---------------------------------------------------------------------------
+
+(deftest parallel-hmc-acceptance-rate
+  (testing "parallel chains have reasonable acceptance rate"
+    (let [constraints (choicemap/choicemap {:x 3.0})
+          result      (gf/generate normal-model [] constraints)
+          chains      (mlx-dyn/parallel-hmc-sample (:trace result) 4 100
+                                                    :L 10 :eps 0.05)
+          total-accepts (reduce + (map (fn [chain]
+                                         (count (filter :accepted? chain)))
+                                       chains))
+          total-proposals (* 4 100)
+          rate (/ (double total-accepts) total-proposals)]
+      (is (> rate 0.2)
+          (str "acceptance rate should be > 20%, got " (* 100 rate) "%")))))

@@ -274,51 +274,55 @@
 
 (defn- score-tag-contribution
   "Compute the score contribution for a single distribution tag using cached params.
-   Returns an MLXArray scalar."
-  [tag params values-arr fast-path?]
-  (case tag
-    :normal
-    (let [{:keys [mus sigmas mask]} params
-          lps (mlx-dist/gaussian-logpdf mus sigmas values-arr)]
-      (if fast-path? (arr/sum lps) (arr/sum (arr/mul mask lps))))
+   Returns an MLXArray scalar (or (N,) when sum-fn is sum-axis for batched mode).
+   Optional sum-fn overrides the reduction (default: arr/sum for scalar output,
+   pass #(arr/sum-axis % 1) for per-chain (N,) output)."
+  ([tag params values-arr fast-path?]
+   (score-tag-contribution tag params values-arr fast-path? arr/sum))
+  ([tag params values-arr fast-path? sum-fn]
+   (case tag
+     :normal
+     (let [{:keys [mus sigmas mask]} params
+           lps (mlx-dist/gaussian-logpdf mus sigmas values-arr)]
+       (if fast-path? (sum-fn lps) (sum-fn (arr/mul mask lps))))
 
-    :exponential
-    (let [{:keys [rates mask]} params
-          lps (mlx-dist/exponential-logpdf rates values-arr)]
-      (if fast-path? (arr/sum lps) (arr/sum (arr/mul mask lps))))
+     :exponential
+     (let [{:keys [rates mask]} params
+           lps (mlx-dist/exponential-logpdf rates values-arr)]
+       (if fast-path? (sum-fn lps) (sum-fn (arr/mul mask lps))))
 
-    :uniform
-    (let [{:keys [los his mask]} params
-          lps (mlx-dist/uniform-logpdf los his values-arr)]
-      (if fast-path? (arr/sum lps) (arr/sum (arr/mul mask lps))))
+     :uniform
+     (let [{:keys [los his mask]} params
+           lps (mlx-dist/uniform-logpdf los his values-arr)]
+       (if fast-path? (sum-fn lps) (sum-fn (arr/mul mask lps))))
 
-    :laplace
-    (let [{:keys [locs scales mask]} params
-          lps (mlx-dist/laplace-logpdf locs scales values-arr)]
-      (if fast-path? (arr/sum lps) (arr/sum (arr/mul mask lps))))
+     :laplace
+     (let [{:keys [locs scales mask]} params
+           lps (mlx-dist/laplace-logpdf locs scales values-arr)]
+       (if fast-path? (sum-fn lps) (sum-fn (arr/mul mask lps))))
 
-    :cauchy
-    (let [{:keys [locs scales mask]} params
-          lps (mlx-dist/cauchy-logpdf locs scales values-arr)]
-      (if fast-path? (arr/sum lps) (arr/sum (arr/mul mask lps))))
+     :cauchy
+     (let [{:keys [locs scales mask]} params
+           lps (mlx-dist/cauchy-logpdf locs scales values-arr)]
+       (if fast-path? (sum-fn lps) (sum-fn (arr/mul mask lps))))
 
-    :beta
-    (let [{:keys [alpha-m1s beta-m1s log-norms mask]} params
-          lps (mlx-dist/beta-logpdf alpha-m1s beta-m1s log-norms values-arr)]
-      (if fast-path? (arr/sum lps) (arr/sum (arr/mul mask lps))))
+     :beta
+     (let [{:keys [alpha-m1s beta-m1s log-norms mask]} params
+           lps (mlx-dist/beta-logpdf alpha-m1s beta-m1s log-norms values-arr)]
+       (if fast-path? (sum-fn lps) (sum-fn (arr/mul mask lps))))
 
-    :gamma
-    (let [{:keys [shape-m1s inv-scales log-norms mask]} params
-          lps (mlx-dist/gamma-logpdf shape-m1s inv-scales log-norms values-arr)]
-      (if fast-path? (arr/sum lps) (arr/sum (arr/mul mask lps))))
+     :gamma
+     (let [{:keys [shape-m1s inv-scales log-norms mask]} params
+           lps (mlx-dist/gamma-logpdf shape-m1s inv-scales log-norms values-arr)]
+       (if fast-path? (sum-fn lps) (sum-fn (arr/mul mask lps))))
 
-    :poisson
-    (let [{:keys [log-lambdas lambdas mask]} params
-          mlx-part (arr/sub (arr/mul values-arr log-lambdas) lambdas)
-          ks (arr/->vec values-arr)
-          lgamma-terms (arr/from-vec (mapv #(gamma/log-gamma (inc (double %))) ks))
-          lps (arr/sub mlx-part lgamma-terms)]
-      (if fast-path? (arr/sum lps) (arr/sum (arr/mul mask lps))))))
+     :poisson
+     (let [{:keys [log-lambdas lambdas mask]} params
+           mlx-part (arr/sub (arr/mul values-arr log-lambdas) lambdas)
+           ks (arr/->vec values-arr)
+           lgamma-terms (arr/from-vec (mapv #(gamma/log-gamma (inc (double %))) ks))
+           lps (arr/sub mlx-part lgamma-terms)]
+       (if fast-path? (arr/sum lps) (arr/sum (arr/mul mask lps)))))))
 
 (defn- compute-score-from-cache
   "Compute total log-probability using pre-cached parameter arrays.
@@ -718,3 +722,153 @@
                          :trace   (->MLXTrace gf new-choices (:log-density sample)
                                               model-args (.-retval trace) info))))
               raw-samples)))))
+
+;; ---------------------------------------------------------------------------
+;; Per-chain score computation — for parallel HMC
+;; ---------------------------------------------------------------------------
+
+(defn- compute-per-chain-score
+  "Like compute-score-from-cache but returns (N,) per-chain scores.
+   Uses sum-axis over dim 1 instead of sum. Broadcasts correctly when
+   values-arr is (N, D) and cached params are (D,)."
+  [{:keys [distinct-tags fast-path? param-cache]} values-arr]
+  (let [sum-axis-1 #(arr/sum-axis % 1)]
+    (reduce
+     (fn [total tag]
+       (when (#{:fallback :poisson} tag)
+         (throw (ex-info "Parallel chains do not support this distribution type"
+                         {:tag tag})))
+       (arr/add total (score-tag-contribution tag (get param-cache tag)
+                                              values-arr fast-path? sum-axis-1)))
+     (arr/scalar 0.0)
+     distinct-tags)))
+
+(defn- build-per-chain-score-fn
+  "Build a function (N, D) → (N,) for per-chain log-densities.
+   Uses the same parameter cache as the total score function."
+  [gf model-args sorted-addrs initial-choices]
+  (let [entries (replay-model-once gf model-args sorted-addrs initial-choices)
+        cache (precompute-param-arrays entries)]
+    (fn [values-arr]
+      (compute-per-chain-score cache values-arr))))
+
+(defn- build-free-per-chain-score-fn
+  "Build per-chain score function for selection-aware parallel inference.
+   Only free-addrs are in the position vector; fixed-addrs contribute a constant."
+  [gf model-args free-addrs fixed-addrs choices]
+  (let [all-addrs (into (vec free-addrs) (mapv :addr fixed-addrs))
+        ;; Constant logpdf contribution from fixed addresses
+        fixed-score (when (seq fixed-addrs)
+                      (let [entries (replay-model-once gf model-args all-addrs choices)
+                            fixed-addr-set (set (mapv :addr fixed-addrs))]
+                        (reduce
+                         (fn [acc [entry addr]]
+                           (let [dist (:dist entry)
+                                 v    (get choices addr)]
+                             (+ acc (double (d/logpdf dist v)))))
+                         0.0
+                         (filter (fn [[_ addr]] (contains? fixed-addr-set addr))
+                                 (map vector entries all-addrs)))))
+        fixed-score-arr (arr/scalar (or fixed-score 0.0))
+        ;; Build cache for free addresses only
+        entries (replay-model-once gf model-args all-addrs choices)
+        free-set (set free-addrs)
+        free-entries (vec (keep (fn [[entry addr]]
+                                  (when (contains? free-set addr) entry))
+                                (map vector entries all-addrs)))
+        cache (precompute-param-arrays free-entries)]
+    (fn [values-arr]
+      (arr/add fixed-score-arr (compute-per-chain-score cache values-arr)))))
+
+;; ---------------------------------------------------------------------------
+;; Parallel HMC bridge — N chains simultaneously
+;; ---------------------------------------------------------------------------
+
+(defn parallel-hmc-sample
+  "Run N parallel HMC chains on the choices of an MLXTrace.
+
+   Uses manual batching: all N chains start from the same initial position
+   and diverge through independent momentum sampling. Operations on (N x D)
+   arrays amortize FFI overhead across chains.
+
+   Options:
+     :L         — leapfrog steps per HMC step (default 10)
+     :eps       — leapfrog step size (default 0.01)
+     :selection — set of addresses to sample (others held fixed)
+
+   Returns a vector of N chains, where each chain is a vector of n-steps
+   result maps:
+     {:position    — MLXArray (1-D)
+      :log-density — double
+      :accepted?   — boolean
+      :choices     — {addr -> double}
+      :trace       — MLXTrace}"
+  [^MLXTrace trace n-chains n-steps
+   & {:keys [L eps selection] :or {L 10 eps 0.01}}]
+  (let [gf           (.-gen-fn trace)
+        model-args   (.-args trace)
+        info         (.-addr-info trace)
+        choices      (.-choices trace)
+        all-addrs    (mapv :addr info)]
+    (if selection
+      ;; Selection-aware: only sample selected addresses
+      (let [sel-set      (set selection)
+            free-addrs   (filterv #(contains? sel-set %) all-addrs)
+            fixed-info   (filterv #(not (contains? sel-set (:addr %))) info)
+            ;; Total score fn: reuse existing build-free-score-fn (works with (N,D) input)
+            total-score-fn (build-free-score-fn gf model-args free-addrs fixed-info choices)
+            ;; Per-chain score fn: (N, D) → (N,)
+            per-chain-fn   (build-free-per-chain-score-fn
+                            gf model-args free-addrs fixed-info choices)
+            init-pos-1d    (arr/from-vec (mapv #(double (get choices %)) free-addrs))
+            initial-positions (arr/stack (repeat n-chains init-pos-1d))
+            raw-steps (hmc/parallel-sample total-score-fn per-chain-fn
+                                           initial-positions n-steps
+                                           :L L :eps eps)
+            D (count free-addrs)]
+        ;; Transpose: step-oriented → chain-oriented
+        (mapv (fn [chain-idx]
+                (mapv (fn [step]
+                        (let [flat (arr/->vec (:positions step))
+                              chain-vals (subvec (vec flat)
+                                                 (* chain-idx D)
+                                                 (* (inc chain-idx) D))
+                              ld (nth (:log-densities step) chain-idx)
+                              acc (nth (:accepted step) chain-idx)
+                              free-choices (zipmap free-addrs chain-vals)
+                              new-choices (merge choices free-choices)]
+                          {:position (arr/from-vec chain-vals)
+                           :log-density ld
+                           :accepted? acc
+                           :choices new-choices
+                           :trace (->MLXTrace gf new-choices ld
+                                              model-args (.-retval trace) info)}))
+                      raw-steps))
+              (range n-chains)))
+      ;; No selection: sample all addresses
+      (let [total-score-fn (build-compiled-score-fn gf model-args all-addrs choices)
+            per-chain-fn   (build-per-chain-score-fn gf model-args all-addrs choices)
+            init-pos-1d    (arr/from-vec (mapv #(double (get choices %)) all-addrs))
+            initial-positions (arr/stack (repeat n-chains init-pos-1d))
+            raw-steps (hmc/parallel-sample total-score-fn per-chain-fn
+                                           initial-positions n-steps
+                                           :L L :eps eps)
+            D (count all-addrs)]
+        ;; Transpose: step-oriented → chain-oriented
+        (mapv (fn [chain-idx]
+                (mapv (fn [step]
+                        (let [flat (arr/->vec (:positions step))
+                              chain-vals (subvec (vec flat)
+                                                 (* chain-idx D)
+                                                 (* (inc chain-idx) D))
+                              ld (nth (:log-densities step) chain-idx)
+                              acc (nth (:accepted step) chain-idx)
+                              new-choices (zipmap all-addrs chain-vals)]
+                          {:position (arr/from-vec chain-vals)
+                           :log-density ld
+                           :accepted? acc
+                           :choices new-choices
+                           :trace (->MLXTrace gf new-choices ld
+                                              model-args (.-retval trace) info)}))
+                      raw-steps))
+              (range n-chains))))))

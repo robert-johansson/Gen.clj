@@ -277,3 +277,42 @@
       (printf "  %-10s %15s %15.4f %15.3f%n"
               "MH-best" (format-time mh-time) mh-dist (trace/get-score best-mh))
       (println))))
+
+;; ---------------------------------------------------------------------------
+;; Benchmark 4: Parallel chains — throughput scaling
+;;
+;; Same model, compare sequential N chains vs parallel N chains
+;; ---------------------------------------------------------------------------
+
+(deftest ^:benchmark parallel-chains-throughput
+  (testing "Parallel chains: throughput scaling (Normal posterior)"
+    (let [n-steps   200
+          obs-constraint (choicemap/choicemap {:x 3.0})
+          mlx-tr0   (:trace (gf/generate mlx-model [] obs-constraint))
+
+          ;; Sequential: run 4 chains one after another
+          seq-start (System/nanoTime)
+          seq-results (doall (for [_ (range 4)]
+                               (mlx-dyn/hmc-sample mlx-tr0 n-steps :L 10 :eps 0.1)))
+          seq-time  (- (System/nanoTime) seq-start)
+          seq-vals  (mapcat (fn [chain] (map #(get (:choices %) :x) (drop 50 chain)))
+                            seq-results)
+
+          ;; Parallel: run 4 chains simultaneously via batched arrays
+          par-start (System/nanoTime)
+          par-chains (mlx-dyn/parallel-hmc-sample mlx-tr0 4 n-steps :L 10 :eps 0.1)
+          par-time  (- (System/nanoTime) par-start)
+          par-vals  (mapcat (fn [chain] (map #(get (:choices %) :x) (drop 50 chain)))
+                            par-chains)]
+
+      (println)
+      (println "=== Benchmark 4: Parallel Chains (4 chains x 200 steps) ===")
+      (printf "  %-15s %15s %10s%n" "Method" "Wall-clock" "Post.Mean")
+      (printf "  %-15s %15s %10s%n" "------" "----------" "---------")
+      (printf "  %-15s %15s %10.3f%n" "4x Sequential"
+              (format-time seq-time) (mean seq-vals))
+      (printf "  %-15s %15s %10.3f%n" "4x Parallel"
+              (format-time par-time) (mean par-vals))
+      (printf "  %-15s %15.1fx%n" "Speedup"
+              (/ (double seq-time) (max 1.0 (double par-time))))
+      (println))))
