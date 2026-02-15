@@ -18,6 +18,7 @@
 #include "mlx/c/ops.h"
 #include "mlx/c/stream.h"
 #include "mlx/c/vector.h"
+#include "mlx/c/transforms_impl.h"
 
 int gen_mlx_fast_apply(void* result_ctx_out, void* closure_ctx,
                        const void* input_ctxs, int n_inputs) {
@@ -261,5 +262,70 @@ cleanup:
     mlx_array_free(eps_arr);
     mlx_array_free(half_eps_arr);
     mlx_stream_free(s);
+    return status;
+}
+
+/*
+ * vmap: trace + replace in a single native call.
+ *
+ * Performs vmap_trace on the closure with the given inputs and in_axes,
+ * then immediately calls vmap_replace to produce real batched outputs.
+ * This keeps all traced arrays alive in the same C scope.
+ *
+ * n_outputs is written with the number of output arrays.
+ * result_ctxs_out must point to space for at least max_outputs void* pointers.
+ */
+int gen_mlx_vmap_apply(void** result_ctxs_out, int* n_outputs_out,
+                        void* closure_ctx,
+                        const void* input_ctxs, int n_inputs,
+                        const int* in_axes, int n_in_axes,
+                        const int* out_axes, int n_out_axes) {
+    mlx_closure cls;
+    cls.ctx = closure_ctx;
+
+    /* Build input vector<array> from raw ctx pointers. */
+    mlx_vector_array input_va = mlx_vector_array_new();
+    void** ptrs = (void**)input_ctxs;
+    for (int i = 0; i < n_inputs; i++) {
+        mlx_array a;
+        a.ctx = ptrs[i];
+        mlx_vector_array_append_value(input_va, a);
+    }
+
+    /* Phase 1: trace */
+    mlx_vector_array trace_outputs = {NULL};
+    mlx_vector_array trace_inputs = {NULL};
+    int status = mlx_detail_vmap_trace(&trace_outputs, &trace_inputs,
+                                        cls, input_va,
+                                        in_axes, (size_t)n_in_axes);
+    if (status != 0) {
+        mlx_vector_array_free(input_va);
+        return status;
+    }
+
+    /* Phase 2: replace */
+    mlx_vector_array result_va = {NULL};
+    status = mlx_detail_vmap_replace(&result_va, input_va,
+                                      trace_inputs, trace_outputs,
+                                      in_axes, (size_t)n_in_axes,
+                                      out_axes, (size_t)n_out_axes);
+
+    if (status == 0) {
+        /* Extract result arrays */
+        int n_out = (int)mlx_vector_array_size(result_va);
+        *n_outputs_out = n_out;
+        for (int i = 0; i < n_out; i++) {
+            mlx_array r = {NULL};
+            status = mlx_vector_array_get(&r, result_va, i);
+            if (status != 0) break;
+            result_ctxs_out[i] = r.ctx;
+        }
+        mlx_vector_array_free(result_va);
+    }
+
+    /* Cleanup traced arrays and input vector */
+    mlx_vector_array_free(trace_outputs);
+    mlx_vector_array_free(trace_inputs);
+    mlx_vector_array_free(input_va);
     return status;
 }

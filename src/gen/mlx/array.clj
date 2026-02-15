@@ -277,6 +277,12 @@
   (let [fa (float-array (map float data))]
     (wrap-handle (ffi/array-new-data fa shape))))
 
+(defn from-ints
+  "Create a 1-d int32 MLXArray from a Clojure vector of integers."
+  [v]
+  (let [ia (int-array (map int v))]
+    (wrap-handle (ffi/array-new-data-int ia [(count v)]))))
+
 ;; ---------------------------------------------------------------------------
 ;; Auto-coercion — numbers become scalar arrays automatically
 ;; ---------------------------------------------------------------------------
@@ -568,3 +574,44 @@
   [a]
   (let [a (ensure-array a)]
     (wrap-handle (ffi/mlx-stop-gradient (handle a)))))
+
+;; ---------------------------------------------------------------------------
+;; Shape manipulation ops
+;; ---------------------------------------------------------------------------
+
+(defn sum-axis
+  "Reduce-sum along a single axis. Returns array with that axis removed
+   (or kept as size-1 if keepdims is true)."
+  ([a axis] (sum-axis a axis false))
+  ([a axis keepdims]
+   (let [a (ensure-array a)]
+     (wrap-handle (ffi/mlx-sum-axis (handle a) axis keepdims)))))
+
+(defn stack
+  "Stack a sequence of arrays along a new axis. All arrays must have the same shape."
+  ([arrays] (stack arrays 0))
+  ([arrays axis]
+   (let [va (ffi/arrays->vector (map handle arrays))]
+     (try
+       (wrap-handle (ffi/mlx-stack-axis va axis))
+       (finally
+         (ffi/vector-array-free va))))))
+
+(defn expand-dims
+  "Insert a new length-1 axis at the given position."
+  [a axis]
+  (let [a (ensure-array a)]
+    (wrap-handle (ffi/mlx-expand-dims (handle a) axis))))
+
+(defn squeeze
+  "Remove a length-1 axis at the given position."
+  [a axis]
+  (let [a (ensure-array a)]
+    (wrap-handle (ffi/mlx-squeeze-axis (handle a) axis))))
+
+(defn take-axis
+  "Take elements from an array along an axis by index."
+  [a indices axis]
+  (let [a (ensure-array a)
+        indices (ensure-array indices)]
+    (wrap-handle (ffi/mlx-take-axis (handle a) (handle indices) axis))))

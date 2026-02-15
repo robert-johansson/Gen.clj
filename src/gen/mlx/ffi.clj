@@ -187,6 +187,26 @@
                   (int (nth shape i))))]
     (raw-array-new-data data-seg shape-seg (int ndim) dtype-float32)))
 
+(defn array-new-data-int
+  "Create an array from an int array buffer.
+   `data` is an int array, `shape` is a vector of ints."
+  [^ints data shape]
+  (let [arena (mem/auto-arena)
+        data-seg (mem/alloc (* 4 (alength data)) arena)
+        _ (dotimes [i (alength data)]
+            (.set (.reinterpret data-seg (* 4 (alength data)))
+                  java.lang.foreign.ValueLayout/JAVA_INT
+                  (* i 4)
+                  (aget data i)))
+        ndim (count shape)
+        shape-seg (mem/alloc (* 4 ndim) arena)
+        _ (dotimes [i ndim]
+            (.set (.reinterpret shape-seg (* 4 ndim))
+                  java.lang.foreign.ValueLayout/JAVA_INT
+                  (* i 4)
+                  (int (nth shape i))))]
+    (raw-array-new-data data-seg shape-seg (int ndim) dtype-int32)))
+
 (defn array-item-float32
   "Extract scalar value as float from an array."
   [arr]
@@ -320,6 +340,87 @@
         res (mem/alloc-instance ::array arena)
         status (raw-mlx-sum res a (byte 0) default-stream)]
     (check-status! status "mlx_sum")
+    (mem/deserialize-from res ::array)))
+
+;; sum_axis: int mlx_sum_axis(mlx_array* res, mlx_array a, int axis, bool keepdims, mlx_stream s)
+(def ^:private raw-mlx-sum-axis
+  (ffi/cfn "mlx_sum_axis"
+           [::mem/pointer ::array ::mem/int ::mem/byte ::stream]
+           ::mem/int))
+
+(defn mlx-sum-axis
+  "Reduce-sum along a single axis."
+  [a axis keepdims]
+  (let [arena (mem/auto-arena)
+        res (mem/alloc-instance ::array arena)
+        status (raw-mlx-sum-axis res a (int axis)
+                                 (if keepdims (byte 1) (byte 0))
+                                 default-stream)]
+    (check-status! status "mlx_sum_axis")
+    (mem/deserialize-from res ::array)))
+
+;; ---------------------------------------------------------------------------
+;; Shape manipulation ops
+;; ---------------------------------------------------------------------------
+
+;; stack_axis: int mlx_stack_axis(mlx_array* res, const mlx_vector_array arrays, int axis, mlx_stream s)
+(def ^:private raw-mlx-stack-axis
+  (ffi/cfn "mlx_stack_axis"
+           [::mem/pointer ::vector-array ::mem/int ::stream]
+           ::mem/int))
+
+(defn mlx-stack-axis
+  "Stack arrays along a new axis."
+  [arrays-va axis]
+  (let [arena (mem/auto-arena)
+        res (mem/alloc-instance ::array arena)
+        status (raw-mlx-stack-axis res arrays-va (int axis) default-stream)]
+    (check-status! status "mlx_stack_axis")
+    (mem/deserialize-from res ::array)))
+
+;; expand_dims: int mlx_expand_dims(mlx_array* res, mlx_array a, int axis, mlx_stream s)
+(def ^:private raw-mlx-expand-dims
+  (ffi/cfn "mlx_expand_dims"
+           [::mem/pointer ::array ::mem/int ::stream]
+           ::mem/int))
+
+(defn mlx-expand-dims
+  "Insert a new axis at the given position."
+  [a axis]
+  (let [arena (mem/auto-arena)
+        res (mem/alloc-instance ::array arena)
+        status (raw-mlx-expand-dims res a (int axis) default-stream)]
+    (check-status! status "mlx_expand_dims")
+    (mem/deserialize-from res ::array)))
+
+;; squeeze_axis: int mlx_squeeze_axis(mlx_array* res, mlx_array a, int axis, mlx_stream s)
+(def ^:private raw-mlx-squeeze-axis
+  (ffi/cfn "mlx_squeeze_axis"
+           [::mem/pointer ::array ::mem/int ::stream]
+           ::mem/int))
+
+(defn mlx-squeeze-axis
+  "Remove a length-1 axis at the given position."
+  [a axis]
+  (let [arena (mem/auto-arena)
+        res (mem/alloc-instance ::array arena)
+        status (raw-mlx-squeeze-axis res a (int axis) default-stream)]
+    (check-status! status "mlx_squeeze_axis")
+    (mem/deserialize-from res ::array)))
+
+;; take_axis: int mlx_take_axis(mlx_array* res, mlx_array a, mlx_array indices, int axis, mlx_stream s)
+(def ^:private raw-mlx-take-axis
+  (ffi/cfn "mlx_take_axis"
+           [::mem/pointer ::array ::array ::mem/int ::stream]
+           ::mem/int))
+
+(defn mlx-take-axis
+  "Take elements along an axis by index."
+  [a indices axis]
+  (let [arena (mem/auto-arena)
+        res (mem/alloc-instance ::array arena)
+        status (raw-mlx-take-axis res a indices (int axis) default-stream)]
+    (check-status! status "mlx_take_axis")
     (mem/deserialize-from res ::array)))
 
 ;; ---------------------------------------------------------------------------
@@ -697,6 +798,120 @@
      :jvps   (mem/deserialize-from res-jvps ::vector-array)}))
 
 ;; ---------------------------------------------------------------------------
+;; vmap — vectorized map (detail API)
+;; ---------------------------------------------------------------------------
+
+;; ---------------------------------------------------------------------------
+;; vmap — direct Panama MethodHandles (bypass coffi for struct-by-value args)
+;;
+;; mlx_detail_vmap_trace and mlx_detail_vmap_replace take struct-by-value
+;; args (mlx_closure, mlx_vector_array). On aarch64, these single-pointer
+;; structs are passed identically to bare pointers. We use direct Panama
+;; MethodHandles to avoid any coffi serialization ambiguity.
+;; ---------------------------------------------------------------------------
+
+(def ^:private vmap-trace-descriptor
+  "FunctionDescriptor for: int mlx_detail_vmap_trace(
+     mlx_vector_array* res_0, mlx_vector_array* res_1,
+     mlx_closure fun, mlx_vector_array inputs,
+     const int* in_axes, size_t in_axes_num)"
+  (java.lang.foreign.FunctionDescriptor/of
+   java.lang.foreign.ValueLayout/JAVA_INT
+   (into-array java.lang.foreign.MemoryLayout
+               [java.lang.foreign.ValueLayout/ADDRESS    ;; res_0 (out ptr)
+                java.lang.foreign.ValueLayout/ADDRESS    ;; res_1 (out ptr)
+                java.lang.foreign.ValueLayout/ADDRESS    ;; fun ctx (struct-as-ptr)
+                java.lang.foreign.ValueLayout/ADDRESS    ;; inputs ctx (struct-as-ptr)
+                java.lang.foreign.ValueLayout/ADDRESS    ;; in_axes (int*)
+                java.lang.foreign.ValueLayout/JAVA_LONG]))) ;; in_axes_num
+
+(def ^:private vmap-trace-handle
+  (let [sym (ffi/find-symbol "mlx_detail_vmap_trace")]
+    (when sym
+      (.downcallHandle (java.lang.foreign.Linker/nativeLinker)
+                       ^java.lang.foreign.MemorySegment sym
+                       ^java.lang.foreign.FunctionDescriptor vmap-trace-descriptor
+                       (into-array java.lang.foreign.Linker$Option [])))))
+
+(def ^:private vmap-replace-descriptor
+  "FunctionDescriptor for: int mlx_detail_vmap_replace(
+     mlx_vector_array* res,
+     mlx_vector_array inputs, mlx_vector_array s_inputs, mlx_vector_array s_outputs,
+     const int* in_axes, size_t in_axes_num,
+     const int* out_axes, size_t out_axes_num)"
+  (java.lang.foreign.FunctionDescriptor/of
+   java.lang.foreign.ValueLayout/JAVA_INT
+   (into-array java.lang.foreign.MemoryLayout
+               [java.lang.foreign.ValueLayout/ADDRESS    ;; res (out ptr)
+                java.lang.foreign.ValueLayout/ADDRESS    ;; inputs ctx
+                java.lang.foreign.ValueLayout/ADDRESS    ;; s_inputs ctx
+                java.lang.foreign.ValueLayout/ADDRESS    ;; s_outputs ctx
+                java.lang.foreign.ValueLayout/ADDRESS    ;; in_axes
+                java.lang.foreign.ValueLayout/JAVA_LONG  ;; in_axes_num
+                java.lang.foreign.ValueLayout/ADDRESS    ;; out_axes
+                java.lang.foreign.ValueLayout/JAVA_LONG]))) ;; out_axes_num
+
+(def ^:private vmap-replace-handle
+  (let [sym (ffi/find-symbol "mlx_detail_vmap_replace")]
+    (when sym
+      (.downcallHandle (java.lang.foreign.Linker/nativeLinker)
+                       ^java.lang.foreign.MemorySegment sym
+                       ^java.lang.foreign.FunctionDescriptor vmap-replace-descriptor
+                       (into-array java.lang.foreign.Linker$Option [])))))
+
+(defn vmap-trace
+  "Trace a closure for vmap. Returns {:outputs va-handle, :inputs va-handle}
+   where each handle is a raw ctx MemorySegment (not a coffi map)."
+  [cls-ctx input-va-ctx in-axes]
+  (let [arena (java.lang.foreign.Arena/ofAuto)
+        n (count in-axes)
+        axes-seg (.allocate arena (* 4 n) 4)
+        _ (dotimes [i n]
+            (.set axes-seg java.lang.foreign.ValueLayout/JAVA_INT
+                  (long (* i 4)) (int (nth in-axes i))))
+        ;; Output pointers (zero-initialized by Arena)
+        out0-seg (.allocate arena 8 8)
+        out1-seg (.allocate arena 8 8)
+        status (int (.invokeWithArguments
+                     ^java.lang.invoke.MethodHandle vmap-trace-handle
+                     (object-array [out0-seg out1-seg
+                                    ^java.lang.foreign.MemorySegment cls-ctx
+                                    ^java.lang.foreign.MemorySegment input-va-ctx
+                                    axes-seg (long n)])))]
+    (check-status! status "mlx_detail_vmap_trace")
+    {:outputs (.get ^java.lang.foreign.MemorySegment out0-seg
+                    java.lang.foreign.ValueLayout/ADDRESS (long 0))
+     :inputs  (.get ^java.lang.foreign.MemorySegment out1-seg
+                    java.lang.foreign.ValueLayout/ADDRESS (long 0))}))
+
+(defn vmap-replace
+  "Produce batched outputs from a vmap trace. Returns ctx MemorySegment for result vector-array."
+  [input-va-ctx s-inputs-ctx s-outputs-ctx in-axes out-axes]
+  (let [arena (java.lang.foreign.Arena/ofAuto)
+        n-in (count in-axes)
+        n-out (count out-axes)
+        in-axes-seg (.allocate arena (* 4 n-in) 4)
+        _ (dotimes [i n-in]
+            (.set in-axes-seg java.lang.foreign.ValueLayout/JAVA_INT
+                  (long (* i 4)) (int (nth in-axes i))))
+        out-axes-seg (.allocate arena (* 4 n-out) 4)
+        _ (dotimes [i n-out]
+            (.set out-axes-seg java.lang.foreign.ValueLayout/JAVA_INT
+                  (long (* i 4)) (int (nth out-axes i))))
+        res-seg (.allocate arena 8 8)
+        status (int (.invokeWithArguments
+                     ^java.lang.invoke.MethodHandle vmap-replace-handle
+                     (object-array [res-seg
+                                    ^java.lang.foreign.MemorySegment input-va-ctx
+                                    ^java.lang.foreign.MemorySegment s-inputs-ctx
+                                    ^java.lang.foreign.MemorySegment s-outputs-ctx
+                                    in-axes-seg (long n-in)
+                                    out-axes-seg (long n-out)])))]
+    (check-status! status "mlx_detail_vmap_replace")
+    (.get ^java.lang.foreign.MemorySegment res-seg
+          java.lang.foreign.ValueLayout/ADDRESS (long 0))))
+
+;; ---------------------------------------------------------------------------
 ;; Compile — trace once, reuse compiled graph
 ;; ---------------------------------------------------------------------------
 
@@ -894,4 +1109,40 @@
         (.downcallHandle (java.lang.foreign.Linker/nativeLinker)
                          ^java.lang.foreign.MemorySegment (.get opt)
                          ^java.lang.foreign.FunctionDescriptor fast-leapfrog-descriptor
+                         (into-array java.lang.foreign.Linker$Option []))))))
+
+;; ---------------------------------------------------------------------------
+;; Fast-path vmap shim — trace + replace in a single native call
+;; ---------------------------------------------------------------------------
+
+(def ^:private fast-vmap-descriptor
+  "FunctionDescriptor for: int gen_mlx_vmap_apply(
+     void** result_ctxs_out, int* n_outputs_out,
+     void* closure_ctx,
+     const void* input_ctxs, int n_inputs,
+     const int* in_axes, int n_in_axes,
+     const int* out_axes, int n_out_axes)"
+  (java.lang.foreign.FunctionDescriptor/of
+   java.lang.foreign.ValueLayout/JAVA_INT
+   (into-array java.lang.foreign.MemoryLayout
+               [java.lang.foreign.ValueLayout/ADDRESS    ;; result_ctxs_out
+                java.lang.foreign.ValueLayout/ADDRESS    ;; n_outputs_out
+                java.lang.foreign.ValueLayout/ADDRESS    ;; closure_ctx
+                java.lang.foreign.ValueLayout/ADDRESS    ;; input_ctxs
+                java.lang.foreign.ValueLayout/JAVA_INT   ;; n_inputs
+                java.lang.foreign.ValueLayout/ADDRESS    ;; in_axes
+                java.lang.foreign.ValueLayout/JAVA_INT   ;; n_in_axes
+                java.lang.foreign.ValueLayout/ADDRESS    ;; out_axes
+                java.lang.foreign.ValueLayout/JAVA_INT]))) ;; n_out_axes
+
+(def fast-vmap-handle
+  "Direct Panama MethodHandle for the vmap shim.
+   nil if shim library is not available."
+  (when shim-lookup
+    (let [opt (.find ^java.lang.foreign.SymbolLookup shim-lookup
+                     "gen_mlx_vmap_apply")]
+      (when (.isPresent opt)
+        (.downcallHandle (java.lang.foreign.Linker/nativeLinker)
+                         ^java.lang.foreign.MemorySegment (.get opt)
+                         ^java.lang.foreign.FunctionDescriptor fast-vmap-descriptor
                          (into-array java.lang.foreign.Linker$Option []))))))

@@ -443,6 +443,67 @@
       (is (and (>= v 0.0) (< v 1.0))))))
 
 ;; ---------------------------------------------------------------------------
+;; Shape manipulation ops
+;; ---------------------------------------------------------------------------
+
+(deftest sum-axis-test
+  (testing "sum-axis along axis 0 of 2D array"
+    (let [a (arr/array [1 2 3 4 5 6] [2 3])
+          result (arr/sum-axis a 0)]
+      (is (= [3] (arr/shape result)))
+      (is (= [5.0 7.0 9.0] (arr/->vec result)))))
+  (testing "sum-axis along axis 1 of 2D array"
+    (let [a (arr/array [1 2 3 4 5 6] [2 3])
+          result (arr/sum-axis a 1)]
+      (is (= [2] (arr/shape result)))
+      (is (= [6.0 15.0] (arr/->vec result)))))
+  (testing "sum-axis with keepdims"
+    (let [a (arr/array [1 2 3 4 5 6] [2 3])
+          result (arr/sum-axis a 1 true)]
+      (is (= [2 1] (arr/shape result)))
+      (is (= [6.0 15.0] (arr/->vec result))))))
+
+(deftest stack-test
+  (testing "stack 1D arrays into 2D"
+    (let [a (arr/from-vec [1 2 3])
+          b (arr/from-vec [4 5 6])
+          result (arr/stack [a b])]
+      (is (= [2 3] (arr/shape result)))
+      (is (= [1.0 2.0 3.0 4.0 5.0 6.0] (arr/->vec result)))))
+  (testing "stack along axis 1"
+    (let [a (arr/from-vec [1 2 3])
+          b (arr/from-vec [4 5 6])
+          result (arr/stack [a b] 1)]
+      (is (= [3 2] (arr/shape result)))
+      (is (= [1.0 4.0 2.0 5.0 3.0 6.0] (arr/->vec result))))))
+
+(deftest expand-dims-test
+  (testing "expand-dims on 1D array"
+    (let [a (arr/from-vec [1 2 3])
+          result (arr/expand-dims a 0)]
+      (is (= [1 3] (arr/shape result)))
+      (is (= [1.0 2.0 3.0] (arr/->vec result)))))
+  (testing "expand-dims at end"
+    (let [a (arr/from-vec [1 2 3])
+          result (arr/expand-dims a 1)]
+      (is (= [3 1] (arr/shape result))))))
+
+(deftest squeeze-test
+  (testing "squeeze removes length-1 axis"
+    (let [a (arr/array [1 2 3] [1 3])
+          result (arr/squeeze a 0)]
+      (is (= [3] (arr/shape result)))
+      (is (= [1.0 2.0 3.0] (arr/->vec result))))))
+
+(deftest take-axis-test
+  (testing "take along axis 0"
+    (let [a (arr/array [1 2 3 4 5 6] [3 2])
+          idx (arr/from-ints [0 2])
+          result (arr/take-axis a idx 0)]
+      (is (= [2 2] (arr/shape result)))
+      (is (= [1.0 2.0 5.0 6.0] (arr/->vec result))))))
+
+;; ---------------------------------------------------------------------------
 ;; Memory management — GC handles cleanup automatically
 ;; ---------------------------------------------------------------------------
 
