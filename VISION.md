@@ -148,7 +148,8 @@ This requires CPS execution (suspend/resume at trace points), which Clojure can 
 **Inference:**
 - [x] Particle filtering / SMC with ESS-based resampling
 - [x] Custom-proposal importance sampling
-- [ ] MLX vmap integration for vectorized particle simulation
+
+*Note: MLX vmap for vectorized particle simulation was originally scoped here but deferred to Phase 4. mlx-c does not yet expose a public vmap API (only internal `mlx_detail_vmap_*` functions), and the implementation requires batch-aware trace representations that pair naturally with the Static DSL work in Phase 4.*
 
 ### Phase 3: Gradient-Based Inference — IN PROGRESS (~40%)
 
@@ -180,6 +181,10 @@ This requires CPS execution (suspend/resume at trace points), which Clojure can 
 - [ ] Static DSL — compiled trace types with incremental updates (like Gen.jl's `@gen (static)`)
 - [ ] Involution MH — generalized reversible-jump MCMC
 - [ ] Programmable inference via inference combinators
+
+**Vectorization:**
+- [ ] MLX vmap for vectorized particle simulation (requires batch-aware traces + public mlx-c vmap API)
+- [ ] `IGenerativeFunction/vectorize` — protocol method returning a batched generative function via vmap
 
 **Performance:**
 - [ ] Arena pooling for hot FFI loops (replace per-call auto-arena)
@@ -301,13 +306,13 @@ Gen.clj's unique positioning: **interactive, low-latency, cross-platform probabi
 ### Medium-term (next milestone)
 - [ ] Variational inference (ELBO + MLX autodiff)
 - [ ] Trainable parameters with gradient accumulation
-- [ ] MLX vmap for vectorized particle simulation
 - [ ] Multivariate Normal with Cholesky
 - [ ] Beta, Gamma, Dirichlet, Poisson on MLX
 - [ ] Comprehensive benchmark suite comparing CPU, MLX, and (via libpython-clj) JAX
 
 ### Long-term
 - [ ] Static DSL with incremental trace updates
+- [ ] MLX vmap for vectorized particle simulation (blocked on public mlx-c vmap API)
 - [ ] Interactive generative functions with CPS execution
 - [ ] Electric Clojure integration for real-time browser-based inference
 - [ ] Active inference agents running on Apple Silicon

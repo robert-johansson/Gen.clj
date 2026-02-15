@@ -73,17 +73,52 @@
   ([f] (value-and-grad f {:argnums [0]}))
   ([f {:keys [argnums] :or {argnums [0]}}]
    (let [cls (->closure f)
-         vag (ffi/value-and-grad cls argnums)]
-     (fn [& args]
-       (let [input-va (ffi/arrays->vector (map arr/handle args))]
-         (try
-           (let [{:keys [values grads]} (ffi/closure-value-and-grad-apply vag input-va)
-                 value (arr/wrap-handle (ffi/vector-array-get values 0))
-                 grad-arrays (vector-array->mlx-arrays grads)]
-             (ffi/vector-array-free values)
-             {:value value :grads grad-arrays})
-           (finally
-             (ffi/vector-array-free input-va))))))))
+         vag (ffi/value-and-grad cls argnums)
+         vag-ctx (:ctx vag)]
+     (if (and ffi/fast-vag-handle (= argnums [0]))
+       ;; Fast path: single FFI call via C shim for the common single-argnum case.
+       ;; Pre-allocates reusable segments to eliminate per-call allocation.
+       (let [arena (java.lang.foreign.Arena/ofAuto)
+             value-out-seg (.allocate arena 8 8)
+             grad-out-seg (.allocate arena 8 8)
+             inputs-seg (.allocate arena (* 8 8) 8)] ;; up to 8 args
+         (with-meta
+           (fn [& args]
+             (let [n (count args)]
+               ;; Write input ctx pointers
+               (dotimes [i n]
+                 (.set ^java.lang.foreign.MemorySegment inputs-seg
+                       java.lang.foreign.ValueLayout/ADDRESS
+                       (long (* i 8))
+                       ^java.lang.foreign.MemorySegment
+                       (:ctx (arr/handle (nth args i)))))
+               ;; Single FFI call
+               (let [status (int (.invokeWithArguments
+                                  ^java.lang.invoke.MethodHandle ffi/fast-vag-handle
+                                  (object-array [value-out-seg grad-out-seg
+                                                 vag-ctx inputs-seg (int n)])))]
+                 (when-not (zero? status)
+                   (throw (ex-info "gen_mlx_fast_vag_apply failed" {:status status})))
+                 {:value (arr/wrap-handle
+                          {:ctx (.get ^java.lang.foreign.MemorySegment value-out-seg
+                                      java.lang.foreign.ValueLayout/ADDRESS (long 0))})
+                  :grads [(arr/wrap-handle
+                           {:ctx (.get ^java.lang.foreign.MemorySegment grad-out-seg
+                                       java.lang.foreign.ValueLayout/ADDRESS (long 0))})]})))
+           {::vag-ctx vag-ctx}))
+       ;; Fallback: coffi-based path
+       (with-meta
+         (fn [& args]
+           (let [input-va (ffi/arrays->vector (map arr/handle args))]
+             (try
+               (let [{:keys [values grads]} (ffi/closure-value-and-grad-apply vag input-va)
+                     value (arr/wrap-handle (ffi/vector-array-get values 0))
+                     grad-arrays (vector-array->mlx-arrays grads)]
+                 (ffi/vector-array-free values)
+                 {:value value :grads grad-arrays})
+               (finally
+                 (ffi/vector-array-free input-va)))))
+         {::vag-ctx vag-ctx})))))
 
 ;; ---------------------------------------------------------------------------
 ;; grad — returns gradient only (standard AD convention)
@@ -232,3 +267,4 @@
                result)
              (finally
                (ffi/vector-array-free input-va)))))))))
+

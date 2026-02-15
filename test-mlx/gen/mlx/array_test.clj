@@ -377,6 +377,75 @@
 ;; Memory management — GC handles cleanup automatically
 ;; ---------------------------------------------------------------------------
 
+;; ---------------------------------------------------------------------------
+;; Comparison & conditional ops
+;; ---------------------------------------------------------------------------
+
+(deftest less-test
+  (testing "element-wise less-than"
+    (let [a (arr/from-vec [1 3 5])
+          b (arr/from-vec [2 2 6])
+          result (arr/less a b)
+          ;; less returns bool dtype; convert to float via where for extraction
+          as-float (arr/where result 1.0 0.0)]
+      (is (= [1.0 0.0 1.0] (arr/->vec as-float)))))
+  (testing "less with scalar auto-coercion"
+    (let [a (arr/from-vec [1 2 3])
+          result (arr/less a 2)
+          as-float (arr/where result 1.0 0.0)]
+      (is (= [1.0 0.0 0.0] (arr/->vec as-float))))))
+
+(deftest greater-test
+  (testing "element-wise greater-than"
+    (let [a (arr/from-vec [1 3 5])
+          b (arr/from-vec [2 2 6])
+          result (arr/greater a b)
+          as-float (arr/where result 1.0 0.0)]
+      (is (= [0.0 1.0 0.0] (arr/->vec as-float))))))
+
+(deftest where-test
+  (testing "branchless select with boolean condition"
+    (let [cond-arr (arr/less (arr/from-vec [1 3 1]) (arr/from-vec [2 2 2]))
+          x (arr/from-vec [10 20 30])
+          y (arr/from-vec [40 50 60])
+          result (arr/where cond-arr x y)]
+      ;; cond is [true false true] -> select [10 50 30]
+      (is (= [10.0 50.0 30.0] (arr/->vec result)))))
+  (testing "where with scalar values"
+    (let [cond-arr (arr/greater (arr/scalar 5.0) (arr/scalar 3.0))
+          result (arr/where cond-arr 100 200)]
+      (is (== 100.0 (arr/->double result))))))
+
+(deftest logaddexp-test
+  (testing "logaddexp is numerically stable log(exp(a) + exp(b))"
+    (let [a (arr/scalar 1.0)
+          b (arr/scalar 2.0)
+          result (arr/->double (arr/logaddexp a b))
+          expected (Math/log (+ (Math/exp 1.0) (Math/exp 2.0)))]
+      (is (< (Math/abs (- expected result)) 1e-5)
+          (str "expected " expected ", got " result))))
+  (testing "logaddexp with large values doesn't overflow"
+    (let [result (arr/->double (arr/logaddexp (arr/scalar 1000.0) (arr/scalar 1001.0)))
+          expected (+ 1001.0 (Math/log (+ (Math/exp -1.0) 1.0)))]
+      (is (< (Math/abs (- expected result)) 1e-2)))))
+
+(deftest stop-gradient-test
+  (testing "stop-gradient returns same value"
+    (is (== 5.0 @(arr/stop-gradient (arr/scalar 5.0))))))
+
+(deftest random-uniform-test
+  (testing "random-uniform produces values in [0, 1)"
+    (let [samples (arr/->vec (arr/random-uniform [100]))]
+      (is (= 100 (count samples)))
+      (is (every? #(and (>= % 0.0) (< % 1.0)) samples))))
+  (testing "random-uniform scalar shape"
+    (let [v (arr/->double (arr/random-uniform []))]
+      (is (and (>= v 0.0) (< v 1.0))))))
+
+;; ---------------------------------------------------------------------------
+;; Memory management — GC handles cleanup automatically
+;; ---------------------------------------------------------------------------
+
 (deftest free-idempotent-test
   (testing "free! is safe to call multiple times"
     (let [a (arr/scalar 42.0)]

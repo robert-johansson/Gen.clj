@@ -522,3 +522,49 @@
   (let [seed (System/nanoTime)
         key-arr (ffi/random-key seed)]
     (wrap-handle (ffi/random-normal shape key-arr))))
+
+(defn random-uniform
+  "Sample from Uniform(0,1) with given shape. Returns MLXArray.
+   Uses MLX's native random number generator."
+  [shape]
+  (let [seed (System/nanoTime)
+        key-arr (ffi/random-key seed)]
+    (wrap-handle (ffi/random-uniform shape key-arr))))
+
+;; ---------------------------------------------------------------------------
+;; Comparison & conditional ops
+;; ---------------------------------------------------------------------------
+
+(defn less
+  "Element-wise less-than comparison. Returns boolean MLXArray."
+  [a b]
+  (let [a (ensure-array a) b (ensure-array b)]
+    (wrap-handle (ffi/mlx-less (handle a) (handle b)))))
+
+(defn greater
+  "Element-wise greater-than comparison. Returns boolean MLXArray."
+  [a b]
+  (let [a (ensure-array a) b (ensure-array b)]
+    (wrap-handle (ffi/mlx-greater (handle a) (handle b)))))
+
+(defn where
+  "Ternary conditional: (where cond x y) selects x where cond is true, y otherwise.
+   All args auto-coerced to MLXArrays. Branchless — stays in the MLX graph."
+  [condition x y]
+  (let [condition (ensure-array condition)
+        x (ensure-array x)
+        y (ensure-array y)]
+    (wrap-handle (ffi/mlx-where (handle condition) (handle x) (handle y)))))
+
+(defn logaddexp
+  "Numerically stable log(exp(a) + exp(b)). Element-wise."
+  [a b]
+  (let [a (ensure-array a) b (ensure-array b)]
+    (wrap-handle (ffi/mlx-logaddexp (handle a) (handle b)))))
+
+(defn stop-gradient
+  "Detach array from gradient computation. The result has the same value
+   but is treated as a constant by autodiff."
+  [a]
+  (let [a (ensure-array a)]
+    (wrap-handle (ffi/mlx-stop-gradient (handle a)))))

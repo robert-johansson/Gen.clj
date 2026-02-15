@@ -195,7 +195,26 @@
           (str "acceptance rate should be > 10%, got " (* 100 rate) "%")))))
 
 ;; ---------------------------------------------------------------------------
-;; 10. Leapfrog one step
+;; 10. Lazy leapfrog
+;; ---------------------------------------------------------------------------
+
+(deftest leapfrog-lazy-returns-mlx-arrays
+  (testing "leapfrog-lazy returns all MLXArrays (no eval)"
+    (let [log-density (fn [x] (arr/mul -0.5 (arr/sum (arr/square x))))
+          vag-fn (xforms/value-and-grad log-density)
+          q (arr/from-vec [1.0 -0.5])
+          p (arr/from-vec [0.5 0.3])
+          eps-arr (arr/scalar 0.1)
+          half-eps-arr (arr/scalar 0.05)
+          result (hmc/leapfrog-lazy vag-fn q p eps-arr half-eps-arr 5)]
+      (is (instance? gen.mlx.array.MLXArray (:position result)))
+      (is (instance? gen.mlx.array.MLXArray (:momentum result)))
+      (is (instance? gen.mlx.array.MLXArray (:log-density result)))
+      ;; log-density should be a scalar MLXArray, not yet evaluated
+      (is (= [] (:shape (:log-density result)))))))
+
+;; ---------------------------------------------------------------------------
+;; 11. Leapfrog one step
 ;; ---------------------------------------------------------------------------
 
 (deftest leapfrog-one-step-test

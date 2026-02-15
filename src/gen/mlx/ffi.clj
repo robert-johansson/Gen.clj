@@ -280,12 +280,32 @@
 (def mlx-multiply (defop-binary "mlx_multiply"))
 (def mlx-divide   (defop-binary "mlx_divide"))
 
-(def mlx-negative (defop-unary "mlx_negative"))
-(def mlx-exp      (defop-unary "mlx_exp"))
-(def mlx-log      (defop-unary "mlx_log"))
-(def mlx-square   (defop-unary "mlx_square"))
-(def mlx-sqrt     (defop-unary "mlx_sqrt"))
-(def mlx-abs      (defop-unary "mlx_abs"))
+(def mlx-negative      (defop-unary "mlx_negative"))
+(def mlx-exp           (defop-unary "mlx_exp"))
+(def mlx-log           (defop-unary "mlx_log"))
+(def mlx-square        (defop-unary "mlx_square"))
+(def mlx-sqrt          (defop-unary "mlx_sqrt"))
+(def mlx-abs           (defop-unary "mlx_abs"))
+(def mlx-stop-gradient (defop-unary "mlx_stop_gradient"))
+
+(def mlx-less      (defop-binary "mlx_less"))
+(def mlx-greater   (defop-binary "mlx_greater"))
+(def mlx-logaddexp (defop-binary "mlx_logaddexp"))
+
+;; where: int mlx_where(mlx_array* res, mlx_array cond, mlx_array x, mlx_array y, mlx_stream s)
+(def ^:private raw-mlx-where
+  (ffi/cfn "mlx_where"
+           [::mem/pointer ::array ::array ::array ::stream]
+           ::mem/int))
+
+(defn mlx-where
+  "Ternary conditional: where(cond, x, y) — x if cond else y, element-wise."
+  [condition x y]
+  (let [arena (mem/auto-arena)
+        res (mem/alloc-instance ::array arena)
+        status (raw-mlx-where res condition x y default-stream)]
+    (check-status! status "mlx_where")
+    (mem/deserialize-from res ::array)))
 
 ;; sum: int mlx_sum(mlx_array* res, mlx_array a, bool keepdims, mlx_stream s)
 (def ^:private raw-mlx-sum
@@ -742,6 +762,38 @@
     (check-status! status "mlx_random_normal")
     (mem/deserialize-from res ::array)))
 
+;; random_uniform: int mlx_random_uniform(mlx_array* res, mlx_array low, mlx_array high,
+;;                   const int* shape, size_t shape_num, mlx_dtype dtype,
+;;                   mlx_array key, mlx_stream s)
+(def ^:private raw-random-uniform
+  (ffi/cfn "mlx_random_uniform"
+           [::mem/pointer ::array ::array ::mem/pointer ::mem/long
+            ::mem/int ::array ::stream]
+           ::mem/int))
+
+(defn random-uniform
+  "Sample from Uniform(0,1) with given shape. Returns ::array handle."
+  [shape-vec key-arr]
+  (let [arena (mem/auto-arena)
+        ndim (count shape-vec)
+        shape-seg (if (zero? ndim)
+                    (mem/alloc 4 arena) ;; dummy for scalar
+                    (let [seg (mem/alloc (* 4 ndim) arena)]
+                      (dotimes [i ndim]
+                        (.set (.reinterpret seg (* 4 ndim))
+                              java.lang.foreign.ValueLayout/JAVA_INT
+                              (* i 4)
+                              (int (nth shape-vec i))))
+                      seg))
+        low-arr  (array-new-float (float 0.0))
+        high-arr (array-new-float (float 1.0))
+        res (mem/alloc-instance ::array arena)
+        status (raw-random-uniform res low-arr high-arr
+                                    shape-seg (long ndim) dtype-float32
+                                    key-arr default-stream)]
+    (check-status! status "mlx_random_uniform")
+    (mem/deserialize-from res ::array)))
+
 ;; ---------------------------------------------------------------------------
 ;; Fast-path shim — single FFI call for compiled closure application
 ;;
@@ -785,4 +837,61 @@
         (.downcallHandle (java.lang.foreign.Linker/nativeLinker)
                          ^java.lang.foreign.MemorySegment (.get opt)
                          ^java.lang.foreign.FunctionDescriptor fast-apply-descriptor
+                         (into-array java.lang.foreign.Linker$Option []))))))
+
+;; ---------------------------------------------------------------------------
+;; Fast-path value-and-grad shim — single FFI call for vag apply
+;; ---------------------------------------------------------------------------
+
+(def ^:private fast-vag-descriptor
+  "FunctionDescriptor for: int gen_mlx_fast_vag_apply(void*, void*, void*, void*, int)"
+  (java.lang.foreign.FunctionDescriptor/of
+   java.lang.foreign.ValueLayout/JAVA_INT
+   (into-array java.lang.foreign.MemoryLayout
+               [java.lang.foreign.ValueLayout/ADDRESS    ;; value_ctx_out
+                java.lang.foreign.ValueLayout/ADDRESS    ;; grad_ctx_out
+                java.lang.foreign.ValueLayout/ADDRESS    ;; vag_closure_ctx
+                java.lang.foreign.ValueLayout/ADDRESS    ;; input_ctxs
+                java.lang.foreign.ValueLayout/JAVA_INT]))) ;; n_inputs
+
+(def fast-vag-handle
+  "Direct Panama MethodHandle for the fast-vag-apply shim.
+   nil if shim library is not available."
+  (when shim-lookup
+    (let [opt (.find ^java.lang.foreign.SymbolLookup shim-lookup
+                     "gen_mlx_fast_vag_apply")]
+      (when (.isPresent opt)
+        (.downcallHandle (java.lang.foreign.Linker/nativeLinker)
+                         ^java.lang.foreign.MemorySegment (.get opt)
+                         ^java.lang.foreign.FunctionDescriptor fast-vag-descriptor
+                         (into-array java.lang.foreign.Linker$Option []))))))
+
+;; ---------------------------------------------------------------------------
+;; Fast-path C leapfrog shim — entire leapfrog loop in native code
+;; ---------------------------------------------------------------------------
+
+(def ^:private fast-leapfrog-descriptor
+  "FunctionDescriptor for: int gen_mlx_leapfrog(void*, void*, void*, void*, void*, void*, float, int)"
+  (java.lang.foreign.FunctionDescriptor/of
+   java.lang.foreign.ValueLayout/JAVA_INT
+   (into-array java.lang.foreign.MemoryLayout
+               [java.lang.foreign.ValueLayout/ADDRESS    ;; final_pos_out
+                java.lang.foreign.ValueLayout/ADDRESS    ;; final_mom_out
+                java.lang.foreign.ValueLayout/ADDRESS    ;; final_val_out
+                java.lang.foreign.ValueLayout/ADDRESS    ;; vag_ctx
+                java.lang.foreign.ValueLayout/ADDRESS    ;; position_ctx
+                java.lang.foreign.ValueLayout/ADDRESS    ;; momentum_ctx
+                java.lang.foreign.ValueLayout/JAVA_FLOAT ;; eps
+                java.lang.foreign.ValueLayout/JAVA_INT]))) ;; L
+
+(def fast-leapfrog-handle
+  "Direct Panama MethodHandle for the leapfrog shim.
+   nil if shim library is not available."
+  (when shim-lookup
+    (let [opt (.find ^java.lang.foreign.SymbolLookup shim-lookup
+                     "gen_mlx_leapfrog")]
+      (when (.isPresent opt)
+        (.downcallHandle (java.lang.foreign.Linker/nativeLinker)
+                         ^java.lang.foreign.MemorySegment (.get opt)
+                         ^java.lang.foreign.FunctionDescriptor fast-leapfrog-descriptor
                          (into-array java.lang.foreign.Linker$Option []))))))
