@@ -303,35 +303,39 @@
   (sample log-density-fn initial-position n-steps :L 1 :eps eps))
 
 ;; ---------------------------------------------------------------------------
-;; Parallel chain HMC — N chains via manual batching on (N x D) arrays
+;; Parallel chain HMC — N chains via vmap over (N x D) arrays
 ;; ---------------------------------------------------------------------------
 
 (defn parallel-sample
-  "Run N parallel HMC chains simultaneously via manual batching.
+  "Run N parallel HMC chains simultaneously via vmap.
 
-   All chains share the same score function. Operations on (N x D) arrays
-   amortize FFI overhead across chains. The leapfrog integrator operates on
-   batched arrays — arithmetic broadcasts with scalar step sizes, and
-   value-and-grad produces (N, D) gradients.
+   All chains share the same score function. The score function operates on
+   a single (D,) position vector and returns a scalar log-density. Internally:
+   - vmap maps score-fn over axis 0 of (N, D) for per-chain scores (N,)
+   - value-and-grad of score-fn on (N, D) broadcasts naturally, giving
+     scalar total + (N, D) gradient for the leapfrog integrator
 
    Parameters:
-     total-score-fn     — (N, D) → scalar. Sum of all per-chain log-densities.
-                          Used by value-and-grad for gradient computation.
-     per-chain-score-fn — (N, D) → (N,). Per-chain log-densities.
-                          Used for Metropolis-Hastings accept/reject.
+     score-fn           — (D,) → scalar. Log-density for a single chain.
      initial-positions  — (N, D) MLXArray.
 
    Options:
      :L   — leapfrog steps per HMC step (default 10)
      :eps — leapfrog step size (default 0.01)
+     :per-chain-score-fn — optional (N, D) → (N,). If not provided, uses
+                           (vmap score-fn). Provide explicitly when score-fn
+                           can't be vmapped (e.g. calls arr/->vec internally).
 
    Returns vector of n-steps maps, each:
      {:positions     (N, D) MLXArray — per-chain positions
       :log-densities [N doubles]    — per-chain log-densities
       :accepted      [N booleans]   — per-chain acceptance}"
-  [total-score-fn per-chain-score-fn initial-positions n-steps
-   & {:keys [L eps] :or {L 10 eps 0.01}}]
-  (let [vag-fn (xforms/value-and-grad total-score-fn)
+  [score-fn initial-positions n-steps
+   & {:keys [L eps per-chain-score-fn] :or {L 10 eps 0.01}}]
+  (let [;; vmap maps score-fn over rows: (N, D) → (N,) per-chain scores
+        per-chain-score-fn (or per-chain-score-fn (xforms/vmap score-fn))
+        ;; score-fn on (N, D) broadcasts naturally: scalar total + (N, D) gradient
+        vag-fn (xforms/value-and-grad score-fn)
         vag-ctx (::xforms/vag-ctx (meta vag-fn))
         [N D] (arr/shape initial-positions)
         eps-arr (arr/scalar eps)

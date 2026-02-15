@@ -148,3 +148,32 @@
           result (vf (arr/from-vec [0 1 2 3]))]
       (is (= [4] (arr/shape result)))
       (is (= [0.0 2.0 6.0 12.0] (arr/->vec result))))))
+
+;; ---------------------------------------------------------------------------
+;; 10. vmap + value-and-grad composition — validates parallel chain pattern
+;; ---------------------------------------------------------------------------
+
+(deftest vmap-with-value-and-grad
+  (testing "vmap composes with value-and-grad through the closure bridge"
+    (let [;; Single-sample score: (D,) → scalar
+          score-fn (fn [x] (arr/mul -0.5 (arr/sum (arr/square x))))
+          ;; vmap maps score over rows: (N, D) → (N,)
+          vmapped-score (xforms/vmap score-fn)
+          ;; value-and-grad of score-fn applied to (N, D) broadcasts naturally
+          vag-fn (xforms/value-and-grad score-fn)
+          ;; Test data: 3 samples, each 2D
+          positions (arr/array [1 0  0 2  1 1] [3 2])]
+      ;; vmap per-chain scores
+      (let [per-chain (vmapped-score positions)]
+        (is (= [3] (arr/shape per-chain)))
+        ;; [1,0] → -0.5*1 = -0.5
+        ;; [0,2] → -0.5*4 = -2.0
+        ;; [1,1] → -0.5*2 = -1.0
+        (is (= [-0.5 -2.0 -1.0] (arr/->vec per-chain))))
+      ;; value-and-grad on batched input — total score + (N, D) gradient
+      (let [{:keys [value grads]} (vag-fn positions)]
+        ;; Total = -0.5 - 2.0 - 1.0 = -3.5
+        (is (close? -3.5 (arr/->double value)))
+        ;; Gradient = -X
+        (is (= [3 2] (arr/shape (first grads))))
+        (is (= [-1.0 0.0 0.0 -2.0 -1.0 -1.0] (arr/->vec (first grads))))))))

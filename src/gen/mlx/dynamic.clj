@@ -460,8 +460,15 @@
 
    When distribution parameters depend on free choices (data-dependent params),
    falls back to per-call model replay for the free portion.
-   When parameters are constant, caches everything for pure MLX evaluation."
-  [gf model-args free-addrs fixed-addrs choices]
+   When parameters are constant, caches everything for pure MLX evaluation.
+
+   Options:
+     :force-constant — if true, always use cached constant params (no model replay).
+                       Produces a pure-MLX function suitable for vmap. Used for
+                       per-chain scoring in parallel HMC when the gradient-accurate
+                       score function handles data-dependent params separately."
+  [gf model-args free-addrs fixed-addrs choices
+   & {:keys [force-constant] :or {force-constant false}}]
   (let [all-addrs (into (vec free-addrs) (mapv :addr fixed-addrs))
         ;; Compute constant logpdf contribution from fixed addresses
         fixed-score (when (seq fixed-addrs)
@@ -477,8 +484,9 @@
                                  (map vector entries all-addrs)))))
         fixed-score-arr (arr/scalar (or fixed-score 0.0))
         ;; Check if free portion has data-dependent params
-        has-deps? (params-depend-on-choices?
-                   gf model-args all-addrs choices)]
+        has-deps? (and (not force-constant)
+                       (params-depend-on-choices?
+                        gf model-args all-addrs choices))]
     (if has-deps?
       ;; Data-dependent params: must replay model each call, but only over free addrs
       (fn [values-arr]
@@ -724,63 +732,6 @@
               raw-samples)))))
 
 ;; ---------------------------------------------------------------------------
-;; Per-chain score computation — for parallel HMC
-;; ---------------------------------------------------------------------------
-
-(defn- compute-per-chain-score
-  "Like compute-score-from-cache but returns (N,) per-chain scores.
-   Uses sum-axis over dim 1 instead of sum. Broadcasts correctly when
-   values-arr is (N, D) and cached params are (D,)."
-  [{:keys [distinct-tags fast-path? param-cache]} values-arr]
-  (let [sum-axis-1 #(arr/sum-axis % 1)]
-    (reduce
-     (fn [total tag]
-       (when (#{:fallback :poisson} tag)
-         (throw (ex-info "Parallel chains do not support this distribution type"
-                         {:tag tag})))
-       (arr/add total (score-tag-contribution tag (get param-cache tag)
-                                              values-arr fast-path? sum-axis-1)))
-     (arr/scalar 0.0)
-     distinct-tags)))
-
-(defn- build-per-chain-score-fn
-  "Build a function (N, D) → (N,) for per-chain log-densities.
-   Uses the same parameter cache as the total score function."
-  [gf model-args sorted-addrs initial-choices]
-  (let [entries (replay-model-once gf model-args sorted-addrs initial-choices)
-        cache (precompute-param-arrays entries)]
-    (fn [values-arr]
-      (compute-per-chain-score cache values-arr))))
-
-(defn- build-free-per-chain-score-fn
-  "Build per-chain score function for selection-aware parallel inference.
-   Only free-addrs are in the position vector; fixed-addrs contribute a constant."
-  [gf model-args free-addrs fixed-addrs choices]
-  (let [all-addrs (into (vec free-addrs) (mapv :addr fixed-addrs))
-        ;; Constant logpdf contribution from fixed addresses
-        fixed-score (when (seq fixed-addrs)
-                      (let [entries (replay-model-once gf model-args all-addrs choices)
-                            fixed-addr-set (set (mapv :addr fixed-addrs))]
-                        (reduce
-                         (fn [acc [entry addr]]
-                           (let [dist (:dist entry)
-                                 v    (get choices addr)]
-                             (+ acc (double (d/logpdf dist v)))))
-                         0.0
-                         (filter (fn [[_ addr]] (contains? fixed-addr-set addr))
-                                 (map vector entries all-addrs)))))
-        fixed-score-arr (arr/scalar (or fixed-score 0.0))
-        ;; Build cache for free addresses only
-        entries (replay-model-once gf model-args all-addrs choices)
-        free-set (set free-addrs)
-        free-entries (vec (keep (fn [[entry addr]]
-                                  (when (contains? free-set addr) entry))
-                                (map vector entries all-addrs)))
-        cache (precompute-param-arrays free-entries)]
-    (fn [values-arr]
-      (arr/add fixed-score-arr (compute-per-chain-score cache values-arr)))))
-
-;; ---------------------------------------------------------------------------
 ;; Parallel HMC bridge — N chains simultaneously
 ;; ---------------------------------------------------------------------------
 
@@ -815,16 +766,21 @@
       (let [sel-set      (set selection)
             free-addrs   (filterv #(contains? sel-set %) all-addrs)
             fixed-info   (filterv #(not (contains? sel-set (:addr %))) info)
-            ;; Total score fn: reuse existing build-free-score-fn (works with (N,D) input)
-            total-score-fn (build-free-score-fn gf model-args free-addrs fixed-info choices)
-            ;; Per-chain score fn: (N, D) → (N,)
-            per-chain-fn   (build-free-per-chain-score-fn
-                            gf model-args free-addrs fixed-info choices)
+            score-fn     (build-free-score-fn gf model-args free-addrs fixed-info choices)
+            ;; Data-dependent score fns call arr/->vec (eval), which is
+            ;; incompatible with vmap tracing. Detect this and build a
+            ;; pure-MLX per-chain function using cached constant params.
+            has-deps?    (params-depend-on-choices? gf model-args all-addrs choices)
+            per-chain-fn (when has-deps?
+                           (build-free-score-fn gf model-args free-addrs fixed-info choices
+                                               :force-constant true))
             init-pos-1d    (arr/from-vec (mapv #(double (get choices %)) free-addrs))
             initial-positions (arr/stack (repeat n-chains init-pos-1d))
-            raw-steps (hmc/parallel-sample total-score-fn per-chain-fn
-                                           initial-positions n-steps
-                                           :L L :eps eps)
+            raw-steps (hmc/parallel-sample score-fn initial-positions n-steps
+                                           :L L :eps eps
+                                           :per-chain-score-fn
+                                           (when per-chain-fn
+                                             (xforms/vmap per-chain-fn)))
             D (count free-addrs)]
         ;; Transpose: step-oriented → chain-oriented
         (mapv (fn [chain-idx]
@@ -846,12 +802,10 @@
                       raw-steps))
               (range n-chains)))
       ;; No selection: sample all addresses
-      (let [total-score-fn (build-compiled-score-fn gf model-args all-addrs choices)
-            per-chain-fn   (build-per-chain-score-fn gf model-args all-addrs choices)
+      (let [score-fn     (build-compiled-score-fn gf model-args all-addrs choices)
             init-pos-1d    (arr/from-vec (mapv #(double (get choices %)) all-addrs))
             initial-positions (arr/stack (repeat n-chains init-pos-1d))
-            raw-steps (hmc/parallel-sample total-score-fn per-chain-fn
-                                           initial-positions n-steps
+            raw-steps (hmc/parallel-sample score-fn initial-positions n-steps
                                            :L L :eps eps)
             D (count all-addrs)]
         ;; Transpose: step-oriented → chain-oriented

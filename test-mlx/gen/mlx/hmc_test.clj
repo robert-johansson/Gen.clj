@@ -237,15 +237,11 @@
 
 (deftest parallel-sample-structure
   (testing "parallel-sample returns correct structure"
-    (let [;; Score function: 2D standard normal
-          ;; For (N, D) input, arr/sum gives scalar total
-          total-score (fn [X] (arr/mul -0.5 (arr/sum (arr/square X))))
-          ;; Per-chain score: sum-axis over dim 1 gives (N,)
-          per-chain-score (fn [X] (arr/mul -0.5 (arr/sum-axis (arr/square X) 1)))
+    (let [;; Single-sample score function: (D,) → scalar
+          score-fn (fn [x] (arr/mul -0.5 (arr/sum (arr/square x))))
           ;; 4 chains, 2 dimensions
           init-pos (arr/array [0 0 0 0 0 0 0 0] [4 2])
-          results (hmc/parallel-sample total-score per-chain-score
-                                        init-pos 5 :L 5 :eps 0.1)]
+          results (hmc/parallel-sample score-fn init-pos 5 :L 5 :eps 0.1)]
       (is (= 5 (count results)))
       (is (contains? (first results) :positions))
       (is (contains? (first results) :log-densities))
@@ -260,12 +256,11 @@
 
 (deftest parallel-sample-posterior
   (testing "parallel chains produce correct posterior statistics for 2D normal"
-    (let [total-score (fn [X] (arr/mul -0.5 (arr/sum (arr/square X))))
-          per-chain-score (fn [X] (arr/mul -0.5 (arr/sum-axis (arr/square X) 1)))
+    (let [;; Single-sample score function: (D,) → scalar
+          score-fn (fn [x] (arr/mul -0.5 (arr/sum (arr/square x))))
           ;; 4 chains, 2 dimensions
           init-pos (arr/array [0 0 0 0 0 0 0 0] [4 2])
-          results (hmc/parallel-sample total-score per-chain-score
-                                        init-pos 300 :L 10 :eps 0.1)
+          results (hmc/parallel-sample score-fn init-pos 300 :L 10 :eps 0.1)
           ;; Collect all samples from all chains (after burn-in)
           samples (mapcat (fn [step]
                             (let [flat (arr/->vec (:positions step))]
@@ -289,11 +284,10 @@
 
 (deftest parallel-sample-acceptance-rate
   (testing "parallel chains have reasonable acceptance rate"
-    (let [total-score (fn [X] (arr/mul -0.5 (arr/sum (arr/square X))))
-          per-chain-score (fn [X] (arr/mul -0.5 (arr/sum-axis (arr/square X) 1)))
+    (let [;; Single-sample score function: (D,) → scalar
+          score-fn (fn [x] (arr/mul -0.5 (arr/sum (arr/square x))))
           init-pos (arr/array [0 0 0 0 0 0 0 0] [4 2])
-          results (hmc/parallel-sample total-score per-chain-score
-                                        init-pos 100 :L 10 :eps 0.1)
+          results (hmc/parallel-sample score-fn init-pos 100 :L 10 :eps 0.1)
           ;; Count total acceptances across all chains
           total-accepts (reduce + (map (fn [step]
                                          (count (filter true? (:accepted step))))
